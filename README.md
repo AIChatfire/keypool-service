@@ -189,8 +189,9 @@ python3 scripts/e2e/e2e_test.py                          # 24 个场景：轮询
 DB/Redis 复用 new-api 现有实例，环境变量与 new-api 同款（`SQL_DSN` / `REDIS_CONN_STRING`）：
 ```bash
 # 1) 修改 docker-compose.yml 里的 SQL_DSN / REDIS_CONN_STRING / AUTH_TOKEN（或写 .env）
-docker compose up -d --build
+docker compose up -d          # 直接拉取 ghcr.io/aichatfire/keypool-service:latest
 curl http://localhost:8080/healthz
+# 本地自构：把 compose 中 image 换成 build: .，再 docker compose up -d --build
 ```
 - DB/Redis 在**宿主机**：默认 compose 已带 `host.docker.internal:host-gateway` 映射，示例 DSN 即用宿主机地址；
   也可用 host 网络模式：`docker compose -f docker-compose.yml -f docker-compose.host.yml up -d`（DSN 用 127.0.0.1）。

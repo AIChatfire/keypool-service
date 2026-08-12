@@ -11,9 +11,11 @@
 
 services:
   keypool:
-    build: .
+    image: ghcr.io/aichatfire/keypool-service:latest   # 预构建镜像，直接拉取
+    # build: .                                       # 需要本地自构时改用这行
     container_name: keypool
     restart: unless-stopped
+    pull_policy: always
     environment:
       # ===== 必填：连接 new-api 的库与 Redis =====
       # MySQL（示例为宿主机 3306；容器内访问宿主机靠下方 host.docker.internal 映射）
