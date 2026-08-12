@@ -184,3 +184,33 @@ PORT=18099 AUTH_TOKEN=e2e-token DATABASE_TYPE=sqlite \
   DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:6379 ./keypool &
 python3 scripts/e2e/e2e_test.py                          # 24 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡
 ```
+
+## Docker Compose 部署（只跑 keypool 薄服务）
+DB/Redis 复用 new-api 现有实例，环境变量与 new-api 同款（`SQL_DSN` / `REDIS_CONN_STRING`）：
+```bash
+# 1) 修改 docker-compose.yml 里的 SQL_DSN / REDIS_CONN_STRING / AUTH_TOKEN（或写 .env）
+docker compose up -d --build
+curl http://localhost:8080/healthz
+```
+- DB/Redis 在**宿主机**：默认 compose 已带 `host.docker.internal:host-gateway` 映射，示例 DSN 即用宿主机地址；
+  也可用 host 网络模式：`docker compose -f docker-compose.yml -f docker-compose.host.yml up -d`（DSN 用 127.0.0.1）。
+- DB/Redis 在**内网其它机器**：直接把 DSN 里的 host 改成内网 IP 即可。
+- 支持 PostgreSQL：`SQL_DSN=postgres://...`（scheme 自动识别）；SQLite：`SQL_DSN=/path/to.db`（容器内需挂载文件）。
+
+## E2E 自测（真实 sqlite + Redis）
+```bash
+python3 scripts/e2e/seed.py /tmp/keypool-e2e.db          # 造 new-api 兼容种子库 + 清 Redis
+PORT=18099 AUTH_TOKEN=e2e-token DATABASE_TYPE=sqlite \
+  DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:6379 ./keypool &
+python3 scripts/e2e/e2e_test.py                          # 24 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡
+```
+
+## Docker Compose 一体化部署（推荐）
+```bash
+docker compose up -d --build          # mysql + redis + new-api(管理平面) + keypool
+# new-api 后台  http://localhost:3000   首次 root/123456（登录后改密）
+# keypool API   http://localhost:8080   Authorization: Bearer $KEYPOOL_AUTH_TOKEN
+```
+- 两服务共享同一 MySQL/Redis；`MYSQL_ROOT_PASSWORD`、`KEYPOOL_AUTH_TOKEN` 用环境变量或 `.env` 覆盖，生产必改。
+- 已有外部 MySQL/Redis/new-api：`docker compose up -d --build keypool`，并在 compose 里把 `DATABASE_DSN`/`REDIS_ADDR` 指向外部实例。
+- new-api 侧建议：后台「运营设置」开"成功请求后自动启用通道"（测活成功自动恢复 key）；本场景 new-api 不转发流量，"自动禁用通道"开关无影响，若它同时转发其它渠道建议关闭以避免双写。

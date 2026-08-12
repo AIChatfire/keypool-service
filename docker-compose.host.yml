@@ -1,0 +1,14 @@
+# host 网络模式覆盖：DB/Redis 跑在宿主机本机时使用
+# docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build
+services:
+  keypool:
+    network_mode: host          # 与主文件 ports/extra_hosts 叠加冲突，compose 会取并集报错，
+    ports: []                   #   因此这里显式清空 ports；extra_hosts 在 host 模式下自动失效
+    extra_hosts: []
+    environment:
+      SQL_DSN: ${SQL_DSN:-root:root123456@tcp(127.0.0.1:3306)/newapi?charset=utf8mb4&parseTime=true}
+      REDIS_CONN_STRING: ${REDIS_CONN_STRING:-redis://127.0.0.1:6379/0}
+      PORT: "8080"              # host 模式下直接占用宿主机 8080
+      AUTH_TOKEN: ${KEYPOOL_AUTH_TOKEN:-change-me}
+      SYNC_INTERVAL_SEC: "60"
+      TZ: Asia/Shanghai

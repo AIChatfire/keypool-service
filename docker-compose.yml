@@ -1,0 +1,50 @@
+# keypool 薄服务单机编排 —— 只跑 keypool 本身
+# DB / Redis 复用 new-api 已有的实例（宿主机或内网均可），环境变量与 new-api 同款：
+#   SQL_DSN            new-api 风格数据源
+#   REDIS_CONN_STRING  redis://[:密码@]主机:端口[/db]
+#
+# 启动：
+#   1) 改下面 environment 里的 SQL_DSN / REDIS_CONN_STRING / AUTH_TOKEN（或写入同目录 .env）
+#   2) docker compose up -d --build
+# 验证：
+#   curl http://localhost:8080/healthz
+
+services:
+  keypool:
+    build: .
+    container_name: keypool
+    restart: unless-stopped
+    environment:
+      # ===== 必填：连接 new-api 的库与 Redis =====
+      # MySQL（示例为宿主机 3306；容器内访问宿主机靠下方 host.docker.internal 映射）
+      SQL_DSN: ${SQL_DSN:-root:root123456@tcp(host.docker.internal:3306)/newapi?charset=utf8mb4&parseTime=true}
+      # PostgreSQL 也可以，scheme 自动识别：
+      # SQL_DSN: postgres://user:pass@host.docker.internal:5432/newapi?sslmode=disable
+      REDIS_CONN_STRING: ${REDIS_CONN_STRING:-redis://host.docker.internal:6379/0}
+      # 带密码：redis://:yourpass@host.docker.internal:6379/0
+
+      # ===== 服务自身 =====
+      PORT: "8080"
+      AUTH_TOKEN: ${KEYPOOL_AUTH_TOKEN:-change-me}   # 生产必改，key:get/key:report 的 Bearer 凭据
+      SYNC_INTERVAL_SEC: "60"                        # options 表配置轮询周期
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+    # Linux 下让容器能解析宿主机（DB/Redis 跑在宿主机时必需；Docker Desktop 自带，可省略）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+# ─────────────────────────────────────────────────────────────
+# 备选：host 网络模式（DB/Redis 就在宿主机上时最省事，直接用 127.0.0.1）
+# 用法：把上面 environment 的 host 改为 127.0.0.1，再执行
+#   docker compose -f docker-compose.yml -f docker-compose.host.yml up -d
+# 或直接在本文件把 keypool 服务改成：
+#   network_mode: host          # 与 ports/extra_hosts 互斥，删掉它们
+#   SQL_DSN: ...@tcp(127.0.0.1:3306)/newapi?...
+#   REDIS_CONN_STRING: redis://127.0.0.1:6379/0
+# ─────────────────────────────────────────────────────────────
