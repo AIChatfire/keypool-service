@@ -18,6 +18,10 @@ const (
 	OptDisableKeywords      = "AutomaticDisableKeywords"
 	optChannelDisableThresh = "ChannelDisableThreshold" // float, ignored
 
+	// OptExtensionPrefix 是 keypool 全部扩展 options 键的命名空间。
+	// UpsertOption 只允许写此前缀下的键，避免误写 new-api 原生配置项。
+	OptExtensionPrefix = "keypool."
+
 	// OptPrefixBalance / OptPrefixBalancePrefix namespace keypool extension keys.
 	OptBalancePrefix  = "keypool.balance."  // keypool.balance.{cid} -> BalanceCfg JSON
 	OptRotationPrefix = "keypool.rotation." // keypool.rotation.{cid} -> RotationCfg JSON

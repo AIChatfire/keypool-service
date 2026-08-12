@@ -15,7 +15,7 @@
                  |    |        |     |
                  | selector   state  |  选 key / 禁用·启用执行
                  |    |        |     |
-                 |  store   redisx   |  gorm 读穿 + 事务写穿 / 锁·游标·用量·幂等·事件
+                 |  store   redisx   |  gorm 读穿 + 行锁事务写穿 / 锁·游标·用量·幂等·事件
                  +----|---------|----+
                       |         |
               +-------v--+  +---v--------+
@@ -31,12 +31,15 @@
 
 - `store`：读 `channels`/`abilities`，事务写穿 `channel_info`/`status`/`other_info`
   与 `abilities.enabled`（**单写者纪律**：只写这四列，见 SPEC §2.3）；
+  写事务内对渠道行加 `SELECT ... FOR UPDATE`（MySQL/PostgreSQL），与 new-api
+  自身的渠道写串行化，避免 read-modify-write 丢失更新。
   `OptionsPoller` 每 `SYNC_INTERVAL_SEC`（默认 60s）轮询 `options` 表生成配置快照。
 - `selector`：渠道确定（cid 直达或 abilities priority 分档 + weight 加权）→
   候选集（启用 key ∩ 当前轮换批次，空则 look-ahead）→ Lua 单 RTT 选 key。
 - `state`：上报处理（幂等 → epoch 校验 → 用量校正 → 渠道锁 → classifier 判定 →
   事务写穿 → 事件 XADD），禁用/启用语义逐字节对齐 new-api。
-- `redisx`：`keypool:` 前缀的游标/用量 hash/衰减元数据/渠道锁/幂等键/事件 Stream。
+- `redisx`：`keypool:` 前缀的游标/用量 hash/衰减元数据/渠道锁/幂等键/事件 Stream，
+  与 new-api 自身键空间零重叠。
 
 ## 快速开始
 
@@ -52,92 +55,251 @@ docker build -t keypool .
 docker run --env-file .env -p 8080:8080 keypool
 ```
 
-统一响应包络：`{"code":0,"message":"ok","data":...,"request_id":"<8字节hex>"}`。
-除 `/healthz` 外全部接口要求 `Authorization: Bearer $AUTH_TOKEN`（失败 401/40100）。
+## 接口约定
 
-## 接口示例
+- 统一响应包络：`{"code":0,"message":"ok","data":...,"request_id":"<16位hex>"}`。
+- 除 `GET /healthz` 外全部接口要求 `Authorization: Bearer $AUTH_TOKEN`（失败 401/`40100`）。
+- 错误包络 code：
 
-以下假设 `TOKEN=$AUTH_TOKEN`，`BASE=http://127.0.0.1:8080`。
+| code | HTTP | 含义 |
+|------|------|------|
+| `40001` | 503 | 无可用 key（`data.retry_after_ms` 给出重试建议） |
+| `40002` | 404 | 渠道不存在 |
+| `40003` | 409 | 幂等冲突（重复上报） |
+| `40010` | 400 | 参数错误 |
+| `40100` | 401 | 未鉴权 / token 错误 |
+| `50001` | 500/503 | 依赖故障（DB/Redis）或内部错误 |
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/v1/keys/select` | 选取一个可用 key（可附带渠道元数据） |
+| POST | `/v1/keys/report` | 上报调用结果（用量/成功/失败，驱动自动禁启） |
+| GET | `/v1/channels/{id}` | 渠道元数据（new-api channels 表投影） |
+| GET | `/v1/channels/{id}/keys` | 渠道 key 列表（状态/用量/轮换状态/脱敏） |
+| PATCH | `/v1/channels/{id}/keys/{idx}` | 手动启用/禁用某个 key |
+| GET/PUT | `/v1/channels/{id}/balance` | 用量均衡配置（读/写） |
+| GET/PUT | `/v1/channels/{id}/rotation` | 时间带批次轮换配置（读/写） |
+| GET | `/v1/channels/{id}/usage` | 渠道用量计数 |
+| POST | `/v1/settings/reload` | 立即重建 options 配置快照 |
+| GET | `/healthz` | 健康检查（裸 JSON，无鉴权） |
+| GET | `/metrics` | Prometheus 指标（需鉴权） |
+
+以下示例假设 `TOKEN=$AUTH_TOKEN`、`BASE=http://127.0.0.1:8080`、`H="Authorization: Bearer $TOKEN"`。
+
+---
+
+### POST /v1/keys/select — 选 key
+
+渠道定位二选一：`channel_id` 直达，或 `group`+`model` 经 abilities 表
+priority 分档 + weight 加权选择。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `channel_id` | int | - | 渠道直达（与 group+model 二选一） |
+| `group` / `model` | string | - | 按分组+模型选渠道 |
+| `retry` | int | 0 | 重试次数，影响 abilities 档位下探 |
+| `exclude` | array | - | 排除项 `[{"channel_id":7,"key_index":1}]` |
+| `mode` | string | 渠道配置 | `polling`\|`random`\|`usage` 覆盖 |
+| `est_tokens` | float | 0 | usage 模式预估预扣量（>0 时签发租约） |
+| `advance_cursor` | bool | true | false=测活 peek，不推轮询游标 |
+| `include_channel` | bool | false | true 时响应附带 `channel` 渠道元数据 |
 
 ```bash
-H="Authorization: Bearer $TOKEN"
-
-# 健康检查（无鉴权）
-curl $BASE/healthz
-
-# 选 key：按渠道直达，或按 group+model 经 abilities 分档加权
-curl -X POST $BASE/v1/key:get -H "$H" -H 'Content-Type: application/json' -d '{
+# 渠道直达
+curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d '{
   "channel_id": 7
 }'
-curl -X POST $BASE/v1/key:get -H "$H" -H 'Content-Type: application/json' -d '{
+
+# 分组+模型，排除已失败 key，usage 均衡 + 预扣，附带渠道元数据
+curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d '{
   "group": "default", "model": "gpt-4o", "retry": 0,
   "exclude": [{"channel_id": 7, "key_index": 1}],
-  "mode": "usage", "est_tokens": 512, "advance_cursor": true
+  "mode": "usage", "est_tokens": 512, "advance_cursor": true,
+  "include_channel": true
 }'
-# → {"code":0,"message":"ok","data":{"channel_id":7,"key_index":0,"key":"sk-...",
-#    "base_url":"...","mode":"usage","epoch":"a1b2c3d4","band":{"index":2,"ends_at":...}},...}
-# 无可用 key → 503 code=40001 data.retry_after_ms=1000；渠道不存在 → 404 code=40002
+```
 
-# 用量/错误上报（Idempotency-Key 头部优先于 body idempotency_key）
-curl -X POST $BASE/v1/key:report -H "$H" -H 'Content-Type: application/json' \
+响应 `data`：
+
+```json
+{
+  "channel_id": 7,
+  "key_index": 0,
+  "key": "sk-...",
+  "base_url": "https://api.upstream.example",
+  "mode": "usage",
+  "epoch": "a1b2c3d4",
+  "band": {"index": 2, "ends_at": 1735689900},
+  "lease_id": "0123...cdef",
+  "channel": {
+    "id": 7, "name": "upstream-a", "type": 1, "status": 1,
+    "group": "default", "models": ["gpt-4o", "gpt-4o-mini"],
+    "base_url": "https://api.upstream.example",
+    "priority": 0, "weight": 0, "auto_ban": true,
+    "multi_key": true, "multi_key_mode": "polling",
+    "key_count": 5, "epoch": "a1b2c3d4"
+  }
+}
+```
+
+- `band` 仅启用批次轮换时出现；`lease_id` 仅 usage 模式且 `est_tokens>0` 时出现；
+  `channel` 仅 `include_channel=true` 时出现。
+- 无可用 key → 503 `code=40001`，`data.retry_after_ms=1000`；渠道不存在 → 404 `code=40002`。
+- **`epoch` 是 key 集合指纹**：拿到 key 后渠道 key 集合若被改动，携带旧 epoch
+  的 report 会被忽略（`stale_epoch_ignored`），调用方应重新 select。
+
+### POST /v1/keys/report — 上报调用结果
+
+驱动用量计数与自动禁用/自动启用。幂等键：`Idempotency-Key` 请求头优先于
+body 的 `idempotency_key`；重复上报 → 409 `code=40003`。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `channel_id` | int | 必填 |
+| `key_index` | int | 与 `key` 二选一定位；同时传则必须一致 |
+| `key` | string | 按 key 字符串精确匹配定位 |
+| `epoch` | string | select 返回的指纹；不匹配则整单忽略 |
+| `success` | bool | 是否成功 |
+| `status_code` / `error_code` / `error_message` | - | 失败时供禁用分类器判定 |
+| `usage` | object | `{"prompt_tokens":100,"completion_tokens":50,"cost":0.002}` |
+| `lease_id` | string | select 签发的租约，按 actual−est 校正用量 |
+| `idempotency_key` | string | 幂等键（头部优先） |
+
+```bash
+curl -X POST $BASE/v1/keys/report -H "$H" -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: req-123' -d '{
   "channel_id": 7, "key_index": 0, "epoch": "a1b2c3d4",
   "success": false, "status_code": 401, "error_message": "Permission denied: ...",
   "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.002}
 }'
-# action ∈ none|key_disabled|channel_disabled|enabled|stale_epoch_ignored
-# 幂等冲突 → 409 code=40003
+```
 
-# 渠道 key 列表（状态/禁用原因/用量/轮换状态/脱敏）
+响应 `data.action` ∈ `none` | `cooldown` | `key_disabled` | `channel_disabled` |
+`enabled` | `stale_epoch_ignored` | `duplicate`；`channel_status` 为动作后的渠道状态。
+
+### GET /v1/channels/{id} — 渠道元数据
+
+返回 `data` = 上文 `channel` 对象同构的 ChannelMeta（id/name/type/status/
+group/models/base_url/priority/weight/auto_ban/multi_key/multi_key_mode/
+key_count/epoch）。渠道不存在 → 404 `code=40002`。
+
+```bash
+curl $BASE/v1/channels/7 -H "$H"
+```
+
+### GET /v1/channels/{id}/keys — key 列表
+
+```bash
 curl $BASE/v1/channels/7/keys -H "$H"
+```
 
-# 手动禁用 / 启用某个 key（禁用 status=2，会写 disabled_reason/time）
-curl -X POST $BASE/v1/channels/7/keys/2:disable -H "$H" -d '{"reason":"人工下线"}'
-curl -X POST $BASE/v1/channels/7/keys/2:enable  -H "$H" -d '{}'
+```json
+{
+  "epoch": "a1b2c3d4", "mode": "polling",
+  "keys": [
+    {"index": 0, "status": 1, "usage": 1234.5, "rotation_state": "active", "key_mask": "sk-a****bbbb"},
+    {"index": 1, "status": 3, "reason": "quota", "disabled_time": 1735689600,
+     "usage": 0, "rotation_state": "standby", "key_mask": "sk-c****dddd"}
+  ]
+}
+```
 
-# 用量均衡配置（写入 options 表 keypool.balance.7，立即刷新快照）
+`status`：1=启用 2=手动禁用 3=自动禁用；`usage` 在 Redis 降级时整体省略；
+`rotation_state` 未配置轮换时为 `""`。
+
+### PATCH /v1/channels/{id}/keys/{idx} — 手动启停 key
+
+```bash
+curl -X PATCH $BASE/v1/channels/7/keys/2 -H "$H" -H 'Content-Type: application/json' -d '{
+  "status": "disabled", "reason": "人工下线"
+}'
+curl -X PATCH $BASE/v1/channels/7/keys/2 -H "$H" -d '{"status": "enabled"}'
+```
+
+`status` ∈ `enabled`|`disabled`（禁用写 status=2 及 disabled_reason/time）。
+响应同 report：`action` ∈ `enabled`|`key_disabled`|`channel_disabled`
+（禁用后全 key 灭 → 渠道联动禁用）。
+
+### GET/PUT /v1/channels/{id}/balance — 用量均衡配置
+
+写入 options 表 `keypool.balance.{cid}` 并立即刷新快照。
+
+```bash
 curl -X PUT $BASE/v1/channels/7/balance -H "$H" -d '{
   "mode": "usage", "metric": "tokens", "decay_interval": 3600, "decay_factor": 0.5
 }'
 curl $BASE/v1/channels/7/balance -H "$H"     # 无配置返回默认值
+```
 
-# 批次轮换配置（band_seconds>=30, active_count>=1）
+`mode` ∈ `usage`|`request`|`auto`；`metric` ∈ `tokens`|`cost`。
+默认值：`{"mode":"auto","metric":"tokens","decay_interval":3600,"decay_factor":0.5}`。
+
+### GET/PUT /v1/channels/{id}/rotation — 批次轮换配置
+
+```bash
 curl -X PUT $BASE/v1/channels/7/rotation -H "$H" -d '{
   "band_seconds": 600, "active_count": 2, "overlap_bands": 0, "order": "index"
 }'
 curl $BASE/v1/channels/7/rotation -H "$H"
+```
 
-# 渠道用量计数（metric 取自 balance 配置，缺省 tokens）
+约束：`band_seconds>=30`、`active_count>=1`、`overlap_bands>=0`、
+`order` ∈ `index`|`shuffle`。默认值：`{"band_seconds":3600,"active_count":1,"overlap_bands":0,"order":"index"}`。
+
+### GET /v1/channels/{id}/usage — 用量计数
+
+```bash
 curl $BASE/v1/channels/7/usage -H "$H"
+# → {"cid":7,"metric":"tokens","counters":{"0":1234.5},"last_decay":1735689600}
+```
 
-# 立即重建 options 快照（不等 60s 轮询）
-curl -X POST $BASE/v1/cache:invalidate -H "$H"
+`metric` 取自 balance 配置（缺省 `tokens`）；Redis 降级 → 503/`50001`。
 
-# Prometheus 指标（需鉴权）
+### POST /v1/settings/reload — 立即重建配置快照
+
+不等 60s 轮询，立即重读 options 表（含 new-api 管理台改的开关与
+keypool 的 balance/rotation 配置）。
+
+```bash
+curl -X POST $BASE/v1/settings/reload -H "$H"     # → {"reloaded":true}
+```
+
+### GET /metrics — Prometheus 指标
+
+```bash
 curl $BASE/metrics -H "$H"
 # keypool_select_total{cid,idx} / keypool_report_total{action} /
 # keypool_band_lookahead_total / keypool_process_uptime_seconds
 ```
 
-错误包络 code：`40001` 无可用 key、`40002` 渠道不存在、`40003` 幂等冲突、
-`40010` 参数错误、`50001` 依赖故障、`40100` 未鉴权。
+## 与 new-api 共存（防冲突设计）
 
-## 与 new-api 共存 checklist
+**写隔离：**
+- **单写者纪律**：keypool 只写 `channels.channel_info` / `channels.status` /
+  `channels.other_info` 与 `abilities.enabled` 四列，以及 `options` 表的
+  `keypool.*` 扩展键（写入路径强制 `keypool.` 前缀校验，物理上无法误写
+  new-api 原生配置项）。不要再用其他脚本/服务直接改这些列。
+- **行锁写穿**：禁用/启用事务内对渠道行 `SELECT ... FOR UPDATE`
+  （MySQL/PostgreSQL）后再 read-modify-write，与 new-api 自身的渠道写
+  串行化，杜绝交错丢失更新；SQLite 由单文件写锁天然串行。
+- **Redis 键空间**：全部 `keypool:` 前缀，与 new-api 自身键零重叠。
 
+**开关协调：**
 - [ ] **关闭 new-api 的自动禁用/自动启用**：二者同时做自动禁用会双写
   `channel_info`。由 keypool 接管后，把 new-api 侧
-  `AutomaticDisableChannelEnabled`/`AutomaticEnableChannelEnabled` 关掉，
-  或保证只有 keypool 依据这些开关动作（keypool 同样读这两个 options，
-  60s 轮询同步）。
-- [ ] **单写者纪律**：keypool 只写 `channels.channel_info` / `channels.status` /
-  `channels.other_info` 与 `abilities.enabled`，以及 `options` 表的
-  `keypool.*` 扩展键。不要再用其他脚本/服务直接改这些列。
+  `AutomaticDisableChannelEnabled`/`AutomaticEnableChannelEnabled` 关掉
+  （keypool 读同两个 options，60s 轮询同步，接管后语义不变）。
 - [ ] **60s 同步窗口**：new-api 管理台改的 options（开关、禁用码表、关键词）
-  与 keypool 的 balance/rotation 配置最迟 `SYNC_INTERVAL_SEC`（默认 60s）
-  生效；需要立即生效时调 `POST /v1/cache:invalidate`。
+  最迟 `SYNC_INTERVAL_SEC`（默认 60s）生效；需要立即生效时调
+  `POST /v1/settings/reload`。
 - [ ] key 集合变更（new-api 后台编辑渠道 key）会改变 epoch：携带旧 epoch 的
-  report 返回 `stale_epoch_ignored`，不做任何写，调用方重新 `key:get` 即可。
-- [ ] Redis 键空间为 `keypool:` 前缀，与 new-api 自身键不冲突。
+  report 返回 `stale_epoch_ignored`，不做任何写，调用方重新 select 即可。
 
 ## 轮换与用量均衡
 
@@ -160,10 +322,10 @@ report 时按实际用量校正。
 ## 降级行为
 
 - **Redis 不可达**：启动时 PING 失败仅记日志，服务以 degraded 模式继续运行。
-  此时 `key:get` / `key:report` / 手动启停因锁与游标不可用而返回
-  `50001`（503）；`GET /v1/channels/{id}/keys` 正常返回但省略 `usage` 字段；
-  `GET .../usage` 返回 503/50001。Redis 恢复后无需重启（连接由 go-redis
-  自动重连，锁/游标/用量路径随之恢复）。
+  此时 `keys/select` / `keys/report` / 手动启停因锁与游标不可用而返回
+  `50001`（503）；`GET /v1/channels/{id}` 与 `GET /v1/channels/{id}/keys`
+  正常返回（后者省略 `usage` 字段）；`GET .../usage` 返回 503/50001。
+  Redis 恢复后无需重启（go-redis 自动重连，锁/游标/用量路径随之恢复）。
 - **DB 不可达**：`store.Open` 失败即退出（fatal）；运行期 DB 错误映射为
   `50001`。
 - **panic**：由 recover 中间件兜底为 500/50001，不会打挂进程。
@@ -178,40 +340,42 @@ go build ./... && go vet ./... && go test ./...
 classifier,selector,state,api}`，禁止反向依赖。
 
 ## E2E 自测（真实 sqlite + Redis）
+
 ```bash
-python3 scripts/e2e/seed.py /tmp/keypool-e2e.db          # 造 new-api 兼容种子库 + 清 Redis
+# 建议使用独立 Redis 实例，避免 flush 本地开发库
+redis-server --port 16399 --daemonize yes
+
+go build -o keypool ./cmd/keypool
+python3 scripts/e2e/seed.py /tmp/keypool-e2e.db 127.0.0.1:16399
 PORT=18099 AUTH_TOKEN=e2e-token DATABASE_TYPE=sqlite \
-  DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:6379 ./keypool &
-python3 scripts/e2e/e2e_test.py                          # 24 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡
+  DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:16399 ./keypool &
+python3 scripts/e2e/e2e_test.py   # 28 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡/渠道元数据/PATCH 启停
 ```
 
 ## Docker Compose 部署（只跑 keypool 薄服务）
+
 DB/Redis 复用 new-api 现有实例，环境变量与 new-api 同款（`SQL_DSN` / `REDIS_CONN_STRING`）：
+
 ```bash
 # 1) 修改 docker-compose.yml 里的 SQL_DSN / REDIS_CONN_STRING / AUTH_TOKEN（或写 .env）
 docker compose up -d          # 直接拉取 ghcr.io/aichatfire/keypool-service:latest
 curl http://localhost:8080/healthz
 # 本地自构：把 compose 中 image 换成 build: .，再 docker compose up -d --build
 ```
+
 - DB/Redis 在**宿主机**：默认 compose 已带 `host.docker.internal:host-gateway` 映射，示例 DSN 即用宿主机地址；
   也可用 host 网络模式：`docker compose -f docker-compose.yml -f docker-compose.host.yml up -d`（DSN 用 127.0.0.1）。
 - DB/Redis 在**内网其它机器**：直接把 DSN 里的 host 改成内网 IP 即可。
 - 支持 PostgreSQL：`SQL_DSN=postgres://...`（scheme 自动识别）；SQLite：`SQL_DSN=/path/to.db`（容器内需挂载文件）。
 
-## E2E 自测（真实 sqlite + Redis）
-```bash
-python3 scripts/e2e/seed.py /tmp/keypool-e2e.db          # 造 new-api 兼容种子库 + 清 Redis
-PORT=18099 AUTH_TOKEN=e2e-token DATABASE_TYPE=sqlite \
-  DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:6379 ./keypool &
-python3 scripts/e2e/e2e_test.py                          # 24 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡
-```
-
 ## Docker Compose 一体化部署（推荐）
+
 ```bash
 docker compose up -d --build          # mysql + redis + new-api(管理平面) + keypool
 # new-api 后台  http://localhost:3000   首次 root/123456（登录后改密）
 # keypool API   http://localhost:8080   Authorization: Bearer $KEYPOOL_AUTH_TOKEN
 ```
+
 - 两服务共享同一 MySQL/Redis；`MYSQL_ROOT_PASSWORD`、`KEYPOOL_AUTH_TOKEN` 用环境变量或 `.env` 覆盖，生产必改。
 - 已有外部 MySQL/Redis/new-api：`docker compose up -d --build keypool`，并在 compose 里把 `DATABASE_DSN`/`REDIS_ADDR` 指向外部实例。
 - new-api 侧建议：后台「运营设置」开"成功请求后自动启用通道"（测活成功自动恢复 key）；本场景 new-api 不转发流量，"自动禁用通道"开关无影响，若它同时转发其它渠道建议关闭以避免双写。

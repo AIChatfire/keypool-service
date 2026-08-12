@@ -49,7 +49,7 @@ func main() {
 
 	// options 轮询器（SYNC_INTERVAL_SEC，缺省 60s），同时作为
 	// SettingsProvider 注入 selector/state/api；Reload 能力供
-	// /v1/cache:invalidate 与 PUT balance|rotation 使用。
+	// /v1/settings/reload 与 PUT balance|rotation 使用。
 	poller := store.NewOptionsPoller(s, time.Duration(cfg.SyncIntervalSec)*time.Second)
 	poller.Start()
 	defer poller.Stop()

@@ -14,7 +14,7 @@ import (
 // 本文件实现 SPEC §5 的业务 handlers。HTTP 层使用 snake_case wire DTO，
 // 在边界转换为 SPEC §4 的领域类型（SelectReq/ReportReq 无 json tag）。
 
-// ---- POST /v1/key:get ----
+// ---- POST /v1/keys/select ----
 
 type keyRefDTO struct {
 	ChannelID int `json:"channel_id"`
@@ -24,14 +24,15 @@ type keyRefDTO struct {
 // selectReqDTO 是 SelectReq 的 wire 形态（snake_case）。
 // AdvanceCursor 用指针以区分“未传”（默认 true）与显式 false。
 type selectReqDTO struct {
-	ChannelID     int         `json:"channel_id"`
-	Group         string      `json:"group"`
-	Model         string      `json:"model"`
-	Retry         int         `json:"retry"`
-	Exclude       []keyRefDTO `json:"exclude"`
-	Mode          string      `json:"mode"`
-	EstTokens     float64     `json:"est_tokens"`
-	AdvanceCursor *bool       `json:"advance_cursor"`
+	ChannelID      int         `json:"channel_id"`
+	Group          string      `json:"group"`
+	Model          string      `json:"model"`
+	Retry          int         `json:"retry"`
+	Exclude        []keyRefDTO `json:"exclude"`
+	Mode           string      `json:"mode"`
+	EstTokens      float64     `json:"est_tokens"`
+	AdvanceCursor  *bool       `json:"advance_cursor"`
+	IncludeChannel bool        `json:"include_channel"` // 响应附带 new-api 渠道元数据
 }
 
 type bandDTO struct {
@@ -41,17 +42,18 @@ type bandDTO struct {
 
 // selectRespDTO 是 SelectResp 的 wire 形态（snake_case）。
 type selectRespDTO struct {
-	ChannelID int      `json:"channel_id"`
-	KeyIndex  int      `json:"key_index"`
-	Key       string   `json:"key"`
-	BaseURL   string   `json:"base_url"`
-	Mode      string   `json:"mode"`
-	Epoch     string   `json:"epoch"`
-	Band      *bandDTO `json:"band,omitempty"`
-	LeaseID   string   `json:"lease_id,omitempty"` // usage 预扣租约（SPEC §4 方案 b）
+	ChannelID int                `json:"channel_id"`
+	KeyIndex  int                `json:"key_index"`
+	Key       string             `json:"key"`
+	BaseURL   string             `json:"base_url"`
+	Mode      string             `json:"mode"`
+	Epoch     string             `json:"epoch"`
+	Band      *bandDTO           `json:"band,omitempty"`
+	LeaseID   string             `json:"lease_id,omitempty"` // usage 预扣租约（SPEC §4 方案 b）
+	Channel   *store.ChannelMeta `json:"channel,omitempty"`  // include_channel=true 时返回
 }
 
-func (rt *router) handleKeyGet(w http.ResponseWriter, r *http.Request) {
+func (rt *router) handleKeySelect(w http.ResponseWriter, r *http.Request) {
 	var body selectReqDTO
 	if err := decodeJSON(r, &body); err != nil {
 		writeBadRequest(w, r, "invalid JSON body: %v", err)
@@ -75,7 +77,8 @@ func (rt *router) handleKeyGet(w http.ResponseWriter, r *http.Request) {
 		Mode:      body.Mode,
 		EstTokens: body.EstTokens,
 		// SPEC §4：AdvanceCursor 默认 true
-		AdvanceCursor: body.AdvanceCursor == nil || *body.AdvanceCursor,
+		AdvanceCursor:  body.AdvanceCursor == nil || *body.AdvanceCursor,
+		IncludeChannel: body.IncludeChannel,
 	}
 	for _, ex := range body.Exclude {
 		req.Exclude = append(req.Exclude, selector.KeyRef{ChannelID: ex.ChannelID, KeyIndex: ex.KeyIndex})
@@ -94,6 +97,7 @@ func (rt *router) handleKeyGet(w http.ResponseWriter, r *http.Request) {
 		Mode:      resp.Mode,
 		Epoch:     resp.Epoch,
 		LeaseID:   resp.LeaseID,
+		Channel:   resp.Channel,
 	}
 	if resp.Band != nil {
 		out.Band = &bandDTO{Index: resp.Band.Index, EndsAt: resp.Band.EndsAt}
@@ -101,7 +105,7 @@ func (rt *router) handleKeyGet(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, r, out)
 }
 
-// ---- POST /v1/key:report ----
+// ---- POST /v1/keys/report ----
 
 type usageDTO struct {
 	PromptTokens     float64 `json:"prompt_tokens"`
@@ -169,48 +173,70 @@ func (rt *router) handleKeyReport(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, r, resp)
 }
 
-// ---- POST /v1/channels/{id}/keys/{idx}:enable | :disable ----
+// ---- PATCH /v1/channels/{id}/keys/{idx} ----
 
-type keyVerbDTO struct {
+// keyStatusPatchDTO 是手动启停 key 的请求体：
+// status ∈ enabled|disabled（映射 new-api status 1|2），reason 仅禁用时生效。
+type keyStatusPatchDTO struct {
+	Status string `json:"status"`
 	Reason string `json:"reason"`
 }
 
-// handleKeyVerb 解析末段 "{idx}:{verb}"（ServeMux 通配符须为完整路径段，
-// 故 "{idx}:enable" 形式在路由层拆不开，于 handler 内解析）。
-func (rt *router) handleKeyVerb(w http.ResponseWriter, r *http.Request) {
+// handlePatchKeyStatus 手动启用/禁用渠道内某个 key（RESTful 资源状态变更，
+// 取代旧式 POST .../keys/{idx}:enable|:disable 动作路径）。
+func (rt *router) handlePatchKeyStatus(w http.ResponseWriter, r *http.Request) {
 	cid, err := pathID(r)
 	if err != nil {
 		writeBadRequest(w, r, "%v", err)
 		return
 	}
-	spec := r.PathValue("spec")
-	idxRaw, verb, ok := strings.Cut(spec, ":")
-	if !ok || (verb != "enable" && verb != "disable") {
-		writeBadRequest(w, r, "invalid key action %q: want {idx}:enable|{idx}:disable", spec)
-		return
-	}
+	idxRaw := r.PathValue("idx")
 	idx, err := strconv.Atoi(idxRaw)
 	if err != nil || idx < 0 {
 		writeBadRequest(w, r, "invalid key index %q", idxRaw)
 		return
 	}
 
-	var body keyVerbDTO
+	var body keyStatusPatchDTO
 	if err := decodeJSON(r, &body); err != nil {
 		writeBadRequest(w, r, "invalid JSON body: %v", err)
 		return
 	}
-
-	status := store.ChannelStatusEnabled
-	if verb == "disable" {
+	var status int
+	switch body.Status {
+	case "enabled":
+		status = store.ChannelStatusEnabled
+	case "disabled":
 		status = store.ChannelStatusManuallyDisabled // 手动禁用 → 2（SPEC §2.1）
+	default:
+		writeBadRequest(w, r, "invalid status %q: want enabled|disabled", body.Status)
+		return
 	}
+
 	resp, err := rt.m.SetKeyStatus(r.Context(), cid, idx, status, body.Reason)
 	if err != nil {
 		writeDomainErr(w, r, err)
 		return
 	}
 	writeOK(w, r, resp)
+}
+
+// ---- GET /v1/channels/{id} ----
+
+// handleGetChannel 返回 new-api 渠道元数据（store.ChannelMeta 投影），
+// 供对接方查询渠道上下文，无需直连 DB。
+func (rt *router) handleGetChannel(w http.ResponseWriter, r *http.Request) {
+	cid, err := pathID(r)
+	if err != nil {
+		writeBadRequest(w, r, "%v", err)
+		return
+	}
+	ch, err := rt.s.GetChannel(cid)
+	if err != nil {
+		writeErr(w, r, http.StatusNotFound, CodeChannelMissing, "channel not found", nil)
+		return
+	}
+	writeOK(w, r, ch.Meta())
 }
 
 // ---- GET /v1/channels/{id}/keys ----

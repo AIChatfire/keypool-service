@@ -10,6 +10,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"keypool/internal/config"
 )
@@ -107,9 +108,25 @@ func (s *Store) UpdateSettings(st *Settings) {
 	s.settings.Store(st)
 }
 
+// rowLockSupported reports whether the dialect supports SELECT ... FOR UPDATE
+// (mysql/postgres). sqlite does not; there we rely on the single-writer file
+// lock and the Redis per-channel lock.
+func (s *Store) rowLockSupported() bool {
+	switch s.db.Dialector.Name() {
+	case "mysql", "postgres":
+		return true
+	}
+	return false
+}
+
 // ApplyKeyStatus persists a key enable/disable, replicating new-api's
 // handlerMultiKeyUpdate + UpdateChannelStatus semantics (SPEC §2.3).
 // It must be called while holding the per-channel lock (SPEC §4).
+//
+// 与 new-api 并发写保护：事务内以 SELECT ... FOR UPDATE（mysql/postgres）
+// 锁定渠道行后再做 read-modify-write。new-api 自身更新 channel_info/status
+// 也走事务写同一行，行锁使两边串行化，避免 read-modify-write 交错导致的
+// 丢失更新（lost update）。sqlite 不支持行锁，跳过（单文件写锁已串行）。
 //
 // status: ChannelStatusEnabled (1) enables the key; 2/3 disable it
 // (manual/auto). For multi-key channels the per-key maps in channel_info
@@ -126,7 +143,11 @@ func (s *Store) ApplyKeyStatus(cid, idx, status int, reason string) (channelStat
 	now := time.Now().Unix()
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		var ch Channel
-		if err := tx.Where("id = ?", cid).First(&ch).Error; err != nil {
+		q := tx.Where("id = ?", cid)
+		if s.rowLockSupported() {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := q.First(&ch).Error; err != nil {
 			return err
 		}
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """E2E 种子数据：创建 new-api 兼容的 sqlite 库（channels/abilities/options）并重置 Redis。
-用法: python3 scripts/e2e/seed.py /tmp/keypool-e2e.db  (随后 flush redis + 调 /v1/cache:invalidate)"""
+用法: python3 scripts/e2e/seed.py [/tmp/keypool-e2e.db] [redis-host:port]
+(随后启动 keypool 并调 /v1/settings/reload)"""
 import sqlite3, json, sys, socket
 
 db_path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/keypool-e2e.db'
+redis_addr = sys.argv[2] if len(sys.argv) > 2 else '127.0.0.1:6379'
 con = sqlite3.connect(db_path)
 c = con.cursor()
 c.executescript('''
@@ -28,7 +30,8 @@ c.executemany("INSERT INTO options VALUES (?,?)", {
     "AutomaticDisableStatusCodes": "401", "AutomaticDisableKeywords": "invalid api key\nquota exceeded"}.items())
 con.commit(); con.close()
 try:
-    s = socket.create_connection(('127.0.0.1', 6379), 2)
+    host, _, port = redis_addr.partition(':')
+    s = socket.create_connection((host, int(port or 6379)), 2)
     s.sendall(b'FLUSHALL\r\n'); s.recv(50); s.close()
 except OSError:
     pass

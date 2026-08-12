@@ -123,6 +123,64 @@ func (c *Channel) EnabledKeyIndexes() []int {
 	return res
 }
 
+// ChannelMeta 是面向调用方的渠道元数据只读投影（new-api channels 表）。
+// 供 key 选取接口（include_channel）与 GET /v1/channels/{id} 返回，
+// 便于对接方无需直连 DB 即可拿到渠道上下文。
+type ChannelMeta struct {
+	ID           int      `json:"id"`
+	Name         string   `json:"name"`
+	Type         int      `json:"type"`
+	Status       int      `json:"status"` // 1=enabled 2=manually_disabled 3=auto_disabled
+	Group        string   `json:"group"`
+	Models       []string `json:"models"`
+	BaseURL      string   `json:"base_url"`
+	Priority     int64    `json:"priority"`
+	Weight       uint     `json:"weight"`
+	AutoBan      bool     `json:"auto_ban"`
+	MultiKey     bool     `json:"multi_key"`
+	MultiKeyMode string   `json:"multi_key_mode"` // 多 key 渠道缺省按 polling 报告
+	KeyCount     int      `json:"key_count"`
+	Epoch        string   `json:"epoch"`
+}
+
+// Meta 构造 Channel 的元数据投影。
+func (c *Channel) Meta() *ChannelMeta {
+	var priority int64
+	if c.Priority != nil {
+		priority = *c.Priority
+	}
+	var weight uint
+	if c.Weight != nil {
+		weight = *c.Weight
+	}
+	models := []string{}
+	for _, m := range strings.Split(c.Models, ",") {
+		if t := strings.TrimSpace(m); t != "" {
+			models = append(models, t)
+		}
+	}
+	mode := c.ChannelInfo.MultiKeyMode
+	if c.ChannelInfo.IsMultiKey && mode == "" {
+		mode = "polling"
+	}
+	return &ChannelMeta{
+		ID:           c.Id,
+		Name:         c.Name,
+		Type:         c.Type,
+		Status:       c.Status,
+		Group:        c.Group,
+		Models:       models,
+		BaseURL:      c.BaseURL,
+		Priority:     priority,
+		Weight:       weight,
+		AutoBan:      c.AutoBan == nil || *c.AutoBan == 1,
+		MultiKey:     c.ChannelInfo.IsMultiKey,
+		MultiKeyMode: mode,
+		KeyCount:     len(c.GetKeys()),
+		Epoch:        c.Epoch(),
+	}
+}
+
 // Ability maps the new-api abilities table (SPEC §2.6).
 type Ability struct {
 	Group     string  `json:"group" gorm:"column:group;primaryKey;autoIncrement:false"`

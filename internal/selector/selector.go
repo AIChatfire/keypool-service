@@ -6,7 +6,7 @@
 //
 // 缓存说明：渠道对象每次 Select 都从 Store 实时读取（DB 级），不引入本地
 // 缓存，保证禁用/启用写穿后立即生效。后续若成为热点，可在 Store 之上加一层
-// 带 TTL/失效通知的渠道快照缓存（由 keypool:events 或 POST /v1/cache:invalidate
+// 带 TTL/失效通知的渠道快照缓存（由 keypool:events 或 POST /v1/settings/reload
 // 驱动失效），Selector 无需改动。
 package selector
 
@@ -46,6 +46,9 @@ type SelectReq struct {
 	Mode          string // ""|polling|random|usage 覆盖渠道配置
 	EstTokens     float64
 	AdvanceCursor bool // 默认 true；false=测活不推游标
+	// IncludeChannel 为 true 时 SelectResp 附带 new-api 渠道元数据
+	//（渠道已在选取流程中加载，零额外 DB 开销）。
+	IncludeChannel bool
 }
 
 // KeyRef 定位某渠道的一个 key（SPEC §4）。
@@ -59,6 +62,8 @@ type SelectResp struct {
 	// LeaseID 是 usage 预扣租约 id（usage 模式且 est>0 时生成），report
 	// 回传以校正 actual−est 双重计数（SPEC §4 方案 b）。
 	LeaseID string `json:"lease_id,omitempty"`
+	// Channel 是 new-api 渠道元数据（仅 SelectReq.IncludeChannel 时填充）。
+	Channel *store.ChannelMeta `json:"channel,omitempty"`
 }
 
 // BandInfo 描述当前轮换时间带（SPEC §4）。
@@ -200,6 +205,9 @@ func (sl *Selector) Select(ctx context.Context, req SelectReq) (*SelectResp, err
 	}
 	if band != nil {
 		resp.Band = band
+	}
+	if req.IncludeChannel {
+		resp.Channel = ch.Meta() // 渠道已在步骤①加载，零额外 DB 开销
 	}
 
 	// usage 预扣租约（SPEC §4 方案 b）：Lua 已预扣 est，生成 lease_id

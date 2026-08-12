@@ -501,3 +501,35 @@ func TestSelectLookaheadBandInfo(t *testing.T) {
 		t.Fatalf("Band.EndsAt = %d, want %d (end of look-ahead band)", resp.Band.EndsAt, wantEnds)
 	}
 }
+
+// IncludeChannel：请求携带时 SelectResp 附带渠道元数据（来自已加载的渠道，
+// 无额外 DB 调用）；未携带时为 nil。
+func TestSelectIncludeChannelMeta(t *testing.T) {
+	ch := multiKeyChannel(7, []string{"k0", "k1"}, nil)
+	ch.Name = "upstream-a"
+	ch.Models = "gpt-4o,gpt-4o-mini"
+	ch.BaseURL = "https://api.x"
+	fc := &fakeChannels{channels: map[int]*store.Channel{7: ch}}
+	sl := newSelector(fc, &fakeKeys{ret: 0}, fakeSP{})
+
+	resp, err := sl.Select(context.Background(), SelectReq{ChannelID: 7, AdvanceCursor: true})
+	if err != nil {
+		t.Fatalf("Select err: %v", err)
+	}
+	if resp.Channel != nil {
+		t.Fatalf("Channel should be nil without IncludeChannel: %+v", resp.Channel)
+	}
+
+	resp, err = sl.Select(context.Background(), SelectReq{ChannelID: 7, AdvanceCursor: true, IncludeChannel: true})
+	if err != nil {
+		t.Fatalf("Select err: %v", err)
+	}
+	meta := resp.Channel
+	if meta == nil {
+		t.Fatalf("Channel meta missing")
+	}
+	if meta.ID != 7 || meta.Name != "upstream-a" || !meta.MultiKey || meta.MultiKeyMode != "polling" ||
+		meta.KeyCount != 2 || len(meta.Models) != 2 || meta.Epoch != ch.Epoch() {
+		t.Fatalf("meta = %+v", meta)
+	}
+}

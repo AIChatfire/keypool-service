@@ -112,18 +112,18 @@ func newRouter(cfg config.Config, sl keySelector, m stateManager, s storeAPI, sp
 	rt := &router{cfg: cfg, sl: sl, m: m, s: s, sp: sp, rdb: rdb, started: time.Now()}
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /v1/key:get", rt.handleKeyGet)
-	mux.HandleFunc("POST /v1/key:report", rt.handleKeyReport)
+	// RESTful 路由（v1 全量；不再保留 key:get / {idx}:enable 等旧式动作路径）。
+	mux.HandleFunc("POST /v1/keys/select", rt.handleKeySelect)
+	mux.HandleFunc("POST /v1/keys/report", rt.handleKeyReport)
+	mux.HandleFunc("GET /v1/channels/{id}", rt.handleGetChannel)
 	mux.HandleFunc("GET /v1/channels/{id}/keys", rt.handleListKeys)
-	// Go1.22 ServeMux 通配符必须是完整路径段，无法直接表达
-	// "{idx}:enable"；用 {spec} 捕获末段后在 handler 内解析 "idx:verb"。
-	mux.HandleFunc("POST /v1/channels/{id}/keys/{spec}", rt.handleKeyVerb)
+	mux.HandleFunc("PATCH /v1/channels/{id}/keys/{idx}", rt.handlePatchKeyStatus)
 	mux.HandleFunc("PUT /v1/channels/{id}/balance", rt.handlePutBalance)
 	mux.HandleFunc("GET /v1/channels/{id}/balance", rt.handleGetBalance)
 	mux.HandleFunc("PUT /v1/channels/{id}/rotation", rt.handlePutRotation)
 	mux.HandleFunc("GET /v1/channels/{id}/rotation", rt.handleGetRotation)
 	mux.HandleFunc("GET /v1/channels/{id}/usage", rt.handleUsage)
-	mux.HandleFunc("POST /v1/cache:invalidate", rt.handleCacheInvalidate)
+	mux.HandleFunc("POST /v1/settings/reload", rt.handleSettingsReload)
 	mux.HandleFunc("GET /healthz", rt.handleHealthz)
 	mux.HandleFunc("GET /metrics", rt.handleMetrics)
 
@@ -307,8 +307,8 @@ func (rt *router) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleCacheInvalidate POST /v1/cache:invalidate：重建 options 快照（SPEC §5）。
-func (rt *router) handleCacheInvalidate(w http.ResponseWriter, r *http.Request) {
+// handleSettingsReload POST /v1/settings/reload：重建 options 快照（SPEC §5）。
+func (rt *router) handleSettingsReload(w http.ResponseWriter, r *http.Request) {
 	if err := rt.reload(); err != nil {
 		writeErr(w, r, http.StatusServiceUnavailable, CodeInternal,
 			fmt.Sprintf("reload settings: %v", err), map[string]any{"reloaded": false})

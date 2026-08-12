@@ -27,7 +27,7 @@ services:
 
       # ===== 服务自身 =====
       PORT: "8080"
-      AUTH_TOKEN: ${KEYPOOL_AUTH_TOKEN:-change-me}   # 生产必改，key:get/key:report 的 Bearer 凭据
+      AUTH_TOKEN: ${KEYPOOL_AUTH_TOKEN:-change-me}   # 生产必改，keys/select、keys/report 的 Bearer 凭据
       SYNC_INTERVAL_SEC: "60"                        # options 表配置轮询周期
       TZ: Asia/Shanghai
     ports:

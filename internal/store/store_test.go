@@ -298,3 +298,68 @@ func TestAbilitiesSQLNoBackticks(t *testing.T) {
 		}
 	}
 }
+
+// UpsertOption 命名空间保护：非 keypool. 前缀的键必须被拒绝（防误写
+// new-api 原生 options）；合法键正常 upsert。
+func TestUpsertOptionPrefixGuard(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.UpsertOption("AutomaticDisableChannelEnabled", "false"); err == nil {
+		t.Fatalf("expected error for non-keypool key")
+	}
+	// 被拒的键不得落库
+	var n int64
+	s.db.Model(&Option{}).Where("key = ?", "AutomaticDisableChannelEnabled").Count(&n)
+	if n != 0 {
+		t.Fatalf("rejected key was persisted")
+	}
+
+	if err := s.UpsertOption(OptBalancePrefix+"7", `{"mode":"usage"}`); err != nil {
+		t.Fatalf("upsert keypool key: %v", err)
+	}
+	if err := s.UpsertOption(OptBalancePrefix+"7", `{"mode":"auto"}`); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	var opt Option
+	if err := s.db.Where("key = ?", OptBalancePrefix+"7").First(&opt).Error; err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !strings.Contains(opt.Value, `"mode":"auto"`) {
+		t.Fatalf("value = %s, want updated", opt.Value)
+	}
+}
+
+// Meta 投影：nil 指针字段安全、models 切分、多 key 缺省 mode、epoch。
+func TestChannelMeta(t *testing.T) {
+	ch := &Channel{
+		Id: 9, Type: 1, Status: 1, Name: "n", Key: "a\nb\nc",
+		Models: "gpt-4o, ,gpt-4o-mini ", Group: "g",
+		ChannelInfo: ChannelInfo{IsMultiKey: true, MultiKeySize: 3},
+	}
+	m := ch.Meta()
+	if m.ID != 9 || m.Priority != 0 || m.Weight != 0 || !m.AutoBan {
+		t.Fatalf("meta = %+v", m)
+	}
+	if m.MultiKeyMode != "polling" { // 多 key 且未设 mode → polling
+		t.Fatalf("mode = %q", m.MultiKeyMode)
+	}
+	if m.KeyCount != 3 || len(m.Models) != 2 || m.Models[1] != "gpt-4o-mini" {
+		t.Fatalf("meta = %+v", m)
+	}
+	if m.Epoch != ch.Epoch() || m.Epoch == "" {
+		t.Fatalf("epoch = %q", m.Epoch)
+	}
+
+	single := &Channel{Id: 1, Key: "sk-x", ChannelInfo: ChannelInfo{IsMultiKey: false}}
+	if sm := single.Meta(); sm.MultiKey || sm.MultiKeyMode != "" || sm.KeyCount != 1 {
+		t.Fatalf("single meta = %+v", sm)
+	}
+}
+
+// ApplyKeyStatus 在 sqlite（无行锁方言）下行为不变——rowLockSupported 跳过分支。
+func TestRowLockDialectGate(t *testing.T) {
+	s := newTestStore(t)
+	if s.rowLockSupported() {
+		t.Fatalf("sqlite must not claim row-lock support")
+	}
+}

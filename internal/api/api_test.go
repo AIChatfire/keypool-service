@@ -179,7 +179,7 @@ func okManager() *fakeManager {
 // 包络格式：成功响应含 code=0/message=ok/data/request_id（16 hex）。
 func TestEnvelopeFormat(t *testing.T) {
 	h := newTestRouter(okSelector(), okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	req := authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`)))
+	req := authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`)))
 	status, env := do(t, h, req)
 	if status != http.StatusOK {
 		t.Fatalf("status=%d", status)
@@ -203,7 +203,7 @@ func TestEnvelopeFormat(t *testing.T) {
 func TestAuth(t *testing.T) {
 	h := newTestRouter(okSelector(), okManager(), &fakeStore{}, &fakeProvider{}, nil)
 
-	status, env := do(t, h, httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{}`)))
+	status, env := do(t, h, httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{}`)))
 	if status != http.StatusUnauthorized || env.Code != CodeUnauthorized {
 		t.Fatalf("no token: status=%d env=%+v", status, env)
 	}
@@ -228,7 +228,7 @@ func TestErrNoKeyMapping(t *testing.T) {
 	sl := okSelector()
 	sl.err = selector.ErrNoKey
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	req := authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`)))
+	req := authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`)))
 	status, env := do(t, h, req)
 	if status != http.StatusServiceUnavailable || env.Code != CodeNoKey {
 		t.Fatalf("status=%d env=%+v", status, env)
@@ -243,7 +243,7 @@ func TestErrNoChannelMapping(t *testing.T) {
 	sl := okSelector()
 	sl.err = selector.ErrNoChannel
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	req := authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":404}`)))
+	req := authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":404}`)))
 	status, env := do(t, h, req)
 	if status != http.StatusNotFound || env.Code != CodeChannelMissing {
 		t.Fatalf("select: status=%d env=%+v", status, env)
@@ -252,7 +252,7 @@ func TestErrNoChannelMapping(t *testing.T) {
 	m := okManager()
 	m.err = fmt.Errorf("%w: 404", state.ErrChannelNotFound)
 	h = newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	req = authed(httptest.NewRequest("POST", "/v1/key:report", strings.NewReader(`{"channel_id":404,"success":true}`)))
+	req = authed(httptest.NewRequest("POST", "/v1/keys/report", strings.NewReader(`{"channel_id":404,"success":true}`)))
 	status, env = do(t, h, req)
 	if status != http.StatusNotFound || env.Code != CodeChannelMissing {
 		t.Fatalf("report: status=%d env=%+v", status, env)
@@ -264,7 +264,7 @@ func TestDuplicateMapping(t *testing.T) {
 	m := okManager()
 	m.resp = &state.ReportResp{Action: "duplicate"}
 	h := newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	req := authed(httptest.NewRequest("POST", "/v1/key:report", strings.NewReader(`{"channel_id":7,"success":true}`)))
+	req := authed(httptest.NewRequest("POST", "/v1/keys/report", strings.NewReader(`{"channel_id":7,"success":true}`)))
 	req.Header.Set("Idempotency-Key", "idem-1")
 	status, env := do(t, h, req)
 	if status != http.StatusConflict || env.Code != CodeDuplicate {
@@ -280,7 +280,7 @@ func TestDuplicateMapping(t *testing.T) {
 func TestIdempotencyKeyFromBody(t *testing.T) {
 	m := okManager()
 	h := newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	req := authed(httptest.NewRequest("POST", "/v1/key:report",
+	req := authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"success":true,"idempotency_key":"body-k"}`)))
 	status, _ := do(t, h, req)
 	if status != http.StatusOK {
@@ -305,7 +305,7 @@ func TestBadRequestMapping(t *testing.T) {
 		t.Fatalf("zero id: status=%d env=%+v", status, env)
 	}
 
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{bad json`))))
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{bad json`))))
 	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
 		t.Fatalf("bad json: status=%d env=%+v", status, env)
 	}
@@ -313,7 +313,7 @@ func TestBadRequestMapping(t *testing.T) {
 	m := okManager()
 	m.err = fmt.Errorf("%w: key index 9 out of range", state.ErrInvalidRequest)
 	h = newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"key_index":9,"success":true}`))))
 	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
 		t.Fatalf("invalid req: status=%d env=%+v", status, env)
@@ -325,7 +325,7 @@ func TestInternalMapping(t *testing.T) {
 	m := okManager()
 	m.err = fmt.Errorf("%w: channel 7 busy", state.ErrLockFailed)
 	h := newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"success":true}`))))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("lock failed: status=%d env=%+v", status, env)
@@ -334,7 +334,7 @@ func TestInternalMapping(t *testing.T) {
 	sl := okSelector()
 	sl.err = errors.New("redis down")
 	h = newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusInternalServerError || env.Code != CodeInternal {
 		t.Fatalf("unknown: status=%d env=%+v", status, env)
 	}
@@ -418,13 +418,14 @@ func TestListKeysNotFound(t *testing.T) {
 	}
 }
 
-// enable/disable：解析 {idx}:{verb} 并映射 status（disable→2）。
-func TestKeyVerb(t *testing.T) {
+// PATCH /v1/channels/{id}/keys/{idx}：status 字符串映射（disabled→2/enabled→1）、
+// idx 解析与校验。
+func TestPatchKeyStatus(t *testing.T) {
 	m := okManager()
 	h := newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
 
-	status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/channels/7/keys/2:disable",
-		strings.NewReader(`{"reason":"manual off"}`))))
+	status, _ := do(t, h, authed(httptest.NewRequest("PATCH", "/v1/channels/7/keys/2",
+		strings.NewReader(`{"status":"disabled","reason":"manual off"}`))))
 	if status != http.StatusOK {
 		t.Fatalf("disable status=%d", status)
 	}
@@ -432,16 +433,88 @@ func TestKeyVerb(t *testing.T) {
 		t.Fatalf("setArgs=%+v", m.setArgs)
 	}
 
-	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/channels/7/keys/2:enable",
-		strings.NewReader(`{}`))))
+	status, _ = do(t, h, authed(httptest.NewRequest("PATCH", "/v1/channels/7/keys/2",
+		strings.NewReader(`{"status":"enabled"}`))))
 	if status != http.StatusOK || m.setArgs.status != 1 {
 		t.Fatalf("enable status=%d args=%+v", status, m.setArgs)
 	}
 
-	// 非法 verb → 40010
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/channels/7/keys/2:boom", strings.NewReader(`{}`))))
+	// 非法 status → 40010
+	status, env := do(t, h, authed(httptest.NewRequest("PATCH", "/v1/channels/7/keys/2",
+		strings.NewReader(`{"status":"boom"}`))))
 	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
-		t.Fatalf("bad verb: status=%d env=%+v", status, env)
+		t.Fatalf("bad status: status=%d env=%+v", status, env)
+	}
+
+	// 非法 idx → 40010
+	status, env = do(t, h, authed(httptest.NewRequest("PATCH", "/v1/channels/7/keys/-1",
+		strings.NewReader(`{"status":"enabled"}`))))
+	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
+		t.Fatalf("bad idx: status=%d env=%+v", status, env)
+	}
+}
+
+// GET /v1/channels/{id}：渠道元数据投影；不存在 → 404/40002。
+func TestGetChannelMeta(t *testing.T) {
+	prio := int64(5)
+	weight := uint(3)
+	ch := &store.Channel{
+		Id: 7, Type: 1, Status: 1, Name: "upstream-a", Key: "k0\nk1",
+		BaseURL: "https://api.x", Models: "gpt-4o, gpt-4o-mini", Group: "default",
+		Priority: &prio, Weight: &weight,
+		ChannelInfo: store.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: "random"},
+	}
+	h := newTestRouter(okSelector(), okManager(), &fakeStore{ch: ch}, &fakeProvider{}, nil)
+
+	status, env := do(t, h, authed(httptest.NewRequest("GET", "/v1/channels/7", nil)))
+	if status != http.StatusOK {
+		t.Fatalf("status=%d env=%+v", status, env)
+	}
+	var meta store.ChannelMeta
+	if err := json.Unmarshal(env.Data, &meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if meta.ID != 7 || meta.Name != "upstream-a" || meta.Priority != 5 || meta.Weight != 3 ||
+		!meta.MultiKey || meta.MultiKeyMode != "random" || meta.KeyCount != 2 ||
+		len(meta.Models) != 2 || meta.Models[1] != "gpt-4o-mini" || !meta.AutoBan || meta.Epoch == "" {
+		t.Fatalf("meta=%+v", meta)
+	}
+
+	status, env = do(t, h, authed(httptest.NewRequest("GET", "/v1/channels/999", nil)))
+	if status != http.StatusNotFound || env.Code != CodeChannelMissing {
+		t.Fatalf("not found: status=%d env=%+v", status, env)
+	}
+}
+
+// select include_channel：请求透传 IncludeChannel，响应透传 channel 元数据。
+func TestSelectIncludeChannel(t *testing.T) {
+	sl := okSelector()
+	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
+
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7,"include_channel":true}`))))
+	if status != http.StatusOK {
+		t.Fatalf("status=%d", status)
+	}
+	if !sl.lastReq.IncludeChannel {
+		t.Fatalf("IncludeChannel not propagated: %+v", sl.lastReq)
+	}
+	// fake 未带元数据 → 响应省略 channel 字段
+	if strings.Contains(string(env.Data), `"channel"`) {
+		t.Fatalf("channel should be omitted when nil: %s", env.Data)
+	}
+
+	// selector 返回元数据 → 响应透传
+	sl2 := okSelector()
+	sl2.resp.Channel = &store.ChannelMeta{ID: 7, Name: "upstream-a", MultiKey: true, KeyCount: 2}
+	h2 := newTestRouter(sl2, okManager(), &fakeStore{}, &fakeProvider{}, nil)
+	status, env = do(t, h2, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7,"include_channel":true}`))))
+	if status != http.StatusOK {
+		t.Fatalf("status=%d", status)
+	}
+	if !strings.Contains(string(env.Data), `"name":"upstream-a"`) {
+		t.Fatalf("channel meta missing: %s", env.Data)
 	}
 }
 
@@ -577,11 +650,11 @@ func TestUsage(t *testing.T) {
 	}
 }
 
-// cache:invalidate → Reload + {reloaded:true}。
+// settings/reload → Reload + {reloaded:true}。
 func TestCacheInvalidate(t *testing.T) {
 	sp := &fakeProvider{}
 	h := newTestRouter(okSelector(), okManager(), &fakeStore{}, sp, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/cache:invalidate", nil)))
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/settings/reload", nil)))
 	if status != http.StatusOK || sp.reloadCalls != 1 {
 		t.Fatalf("status=%d reloads=%d", status, sp.reloadCalls)
 	}
@@ -590,7 +663,7 @@ func TestCacheInvalidate(t *testing.T) {
 	}
 
 	sp.reloadErr = errors.New("db down")
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/cache:invalidate", nil)))
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/settings/reload", nil)))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("reload fail: status=%d env=%+v", status, env)
 	}
@@ -622,7 +695,7 @@ func TestPanicRecover(t *testing.T) {
 	sl := okSelector()
 	sl.resp = nil // Select 返回 (nil, nil) 触发 handler 解引用 panic
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusInternalServerError || env.Code != CodeInternal {
 		t.Fatalf("status=%d env=%+v", status, env)
 	}
@@ -687,12 +760,12 @@ func TestHealthzBareJSON(t *testing.T) {
 	}
 }
 
-// P2-6 回归：key:get 的 mode 校验与参数全空校验 → 40010。
+// P2-6 回归：keys/select 的 mode 校验与参数全空校验 → 40010。
 func TestKeyGetValidation(t *testing.T) {
 	h := newTestRouter(okSelector(), okManager(), &fakeStore{}, &fakeProvider{}, nil)
 
 	// 非法 mode → 40010
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get",
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
 		strings.NewReader(`{"channel_id":7,"mode":"banana"}`))))
 	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
 		t.Fatalf("bad mode: status=%d env=%+v", status, env)
@@ -701,7 +774,7 @@ func TestKeyGetValidation(t *testing.T) {
 	// 合法 mode 集合
 	for _, m := range []string{"polling", "random", "usage", ""} {
 		body := `{"channel_id":7,"mode":"` + m + `"}`
-		status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(body))))
+		status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(body))))
 		if status != http.StatusOK {
 			t.Fatalf("mode %q should be valid: status=%d", m, status)
 		}
@@ -714,14 +787,14 @@ func TestKeyGetValidation(t *testing.T) {
 		`{"model":"gpt-x"}`,            // 缺 group
 		`{"channel_id":0,"group":"g"}`, // channel_id=0 视同未传
 	} {
-		status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(body))))
+		status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(body))))
 		if status != http.StatusBadRequest || env.Code != CodeBadRequest {
 			t.Fatalf("body=%s: status=%d env=%+v, want 40010", body, status, env)
 		}
 	}
 
 	// group+model 齐全（无 channel_id）→ 通过校验
-	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get",
+	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
 		strings.NewReader(`{"group":"default","model":"gpt-x"}`))))
 	if status != http.StatusOK {
 		t.Fatalf("group+model: status=%d", status)
@@ -734,7 +807,7 @@ func TestDegradedErrorMapping(t *testing.T) {
 	sl := okSelector()
 	sl.err = fmt.Errorf("selector: select key: %w", redisx.ErrDegraded)
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("select degraded: status=%d env=%+v", status, env)
 	}
@@ -743,7 +816,7 @@ func TestDegradedErrorMapping(t *testing.T) {
 	m := okManager()
 	m.err = fmt.Errorf("state: usage incr: %w", redisx.ErrDegraded)
 	h = newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"success":true}`))))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("report degraded: status=%d env=%+v", status, env)
@@ -756,7 +829,7 @@ func TestDependencyErrorMapping(t *testing.T) {
 	sl := okSelector()
 	sl.err = fmt.Errorf("%w: get channel 7: connection refused", selector.ErrDependency)
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("select dependency: status=%d env=%+v", status, env)
 	}
@@ -764,7 +837,7 @@ func TestDependencyErrorMapping(t *testing.T) {
 	m := okManager()
 	m.err = fmt.Errorf("%w: get channel 7: connection refused", state.ErrDependency)
 	h = newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
-	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, env = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"success":true}`))))
 	if status != http.StatusServiceUnavailable || env.Code != CodeInternal {
 		t.Fatalf("report dependency: status=%d env=%+v", status, env)
@@ -776,7 +849,7 @@ func TestKeyGetLeaseIDPassthrough(t *testing.T) {
 	sl := okSelector()
 	sl.resp.LeaseID = "0123456789abcdef0123456789abcdef"
 	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
-	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusOK {
 		t.Fatalf("status=%d", status)
 	}
@@ -791,7 +864,7 @@ func TestKeyGetLeaseIDPassthrough(t *testing.T) {
 	// 无租约（非 usage / est=0）→ 字段省略
 	sl2 := okSelector()
 	status, env = do(t, newTestRouter(sl2, okManager(), &fakeStore{}, &fakeProvider{}, nil),
-		authed(httptest.NewRequest("POST", "/v1/key:get", strings.NewReader(`{"channel_id":7}`))))
+		authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(`{"channel_id":7}`))))
 	if status != http.StatusOK {
 		t.Fatalf("status=%d", status)
 	}
@@ -800,13 +873,13 @@ func TestKeyGetLeaseIDPassthrough(t *testing.T) {
 	}
 }
 
-// P1-3 回归（api 侧）：key:report 的 key_index 为 *int——未传 → nil
+// P1-3 回归（api 侧）：keys/report 的 key_index 为 *int——未传 → nil
 // （不被零值遮蔽为显式 0），显式 0 → 指针指向 0。
 func TestKeyReportKeyIndexPointer(t *testing.T) {
 	m := okManager()
 	h := newTestRouter(okSelector(), m, &fakeStore{}, &fakeProvider{}, nil)
 
-	status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"key":"gamma","success":true}`))))
 	if status != http.StatusOK {
 		t.Fatalf("status=%d", status)
@@ -815,7 +888,7 @@ func TestKeyReportKeyIndexPointer(t *testing.T) {
 		t.Fatalf("KeyIndex = %v, want nil (not provided)", *m.lastRep.KeyIndex)
 	}
 
-	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/key:report",
+	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/report",
 		strings.NewReader(`{"channel_id":7,"key_index":0,"success":true}`))))
 	if status != http.StatusOK {
 		t.Fatalf("status=%d", status)
