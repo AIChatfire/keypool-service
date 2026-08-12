@@ -137,14 +137,38 @@ curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d
   "lease_id": "0123...cdef",
   "channel": {
     "id": 7, "name": "upstream-a", "type": 1, "status": 1,
-    "group": "default", "models": ["gpt-4o", "gpt-4o-mini"],
+    "group": "default", "tag": "paid", "remark": "主用上游",
+    "models": ["gpt-4o", "gpt-4o-mini"],
     "base_url": "https://api.upstream.example",
     "priority": 0, "weight": 0, "auto_ban": true,
     "multi_key": true, "multi_key_mode": "polling",
-    "key_count": 5, "epoch": "a1b2c3d4"
+    "key_count": 5, "enabled_key_count": 4, "epoch": "a1b2c3d4",
+    "openai_organization": "org-xxx", "test_model": "gpt-4o-mini",
+    "created_time": 1700000000, "test_time": 1700000100, "response_time": 233,
+    "balance": 12.5, "balance_updated_time": 1700000200, "used_quota": 12345,
+    "model_mapping": {"gpt-4o": "gpt-4o-2024-08-06"},
+    "status_code_mapping": {"503": "500"},
+    "header_override": {"X-Custom-Header": "v"},
+    "param_override": {"temperature": 0.5},
+    "setting": {"proxy": "http://127.0.0.1:7890"},
+    "settings": {"azure_api_version": "2024-08-01-preview"},
+    "other": {"region": "us"},
+    "other_info": {"status_reason": "...", "status_time": 1700000300}
   }
 }
 ```
+
+`channel`（ChannelMeta）覆盖 new-api channels 表全量上下文：
+
+| 分组 | 字段 |
+|------|------|
+| 基础 | `id` `name` `type` `status` `group` `tag` `remark` `models` `base_url` `priority` `weight` `auto_ban` |
+| 多 key | `multi_key` `multi_key_mode` `key_count` `enabled_key_count` `epoch` |
+| 运维/测活 | `openai_organization` `test_model` `created_time` `test_time` `response_time`(ms) `balance`(USD) `balance_updated_time` `used_quota` |
+| 覆盖/映射 | `model_mapping` `status_code_mapping` `header_override`（自定义请求标头）`param_override`（请求体参数覆盖）`setting`（渠道额外设置）`settings`（azure 版本等）`other`（旧版配置）`other_info`（status_reason/status_time 等） |
+
+JSON 字符串列均解析为对象透出；为空或解析失败时该字段省略。
+**注意**：`header_override`/`param_override` 等可能含敏感配置，接口由 `AUTH_TOKEN` 保护，按需授权。
 
 - `band` 仅启用批次轮换时出现；`lease_id` 仅 usage 模式且 `est_tokens>0` 时出现；
   `channel` 仅 `include_channel=true` 时出现。
@@ -185,9 +209,10 @@ curl -X POST $BASE/v1/keys/report -H "$H" -H 'Content-Type: application/json' \
 
 ### GET /v1/channels/{id} — 渠道元数据
 
-返回 `data` = 上文 `channel` 对象同构的 ChannelMeta（id/name/type/status/
-group/models/base_url/priority/weight/auto_ban/multi_key/multi_key_mode/
-key_count/epoch）。渠道不存在 → 404 `code=40002`。
+返回 `data` = 上文 `channel` 对象同构的 ChannelMeta 全量投影（基础字段 +
+多 key 状态 + 运维/测活信息 + model_mapping/status_code_mapping/
+header_override/param_override/setting/settings/other/other_info 等覆盖配置）。
+渠道不存在 → 404 `code=40002`。
 
 ```bash
 curl $BASE/v1/channels/7 -H "$H"
@@ -349,7 +374,7 @@ go build -o keypool ./cmd/keypool
 python3 scripts/e2e/seed.py /tmp/keypool-e2e.db 127.0.0.1:16399
 PORT=18099 AUTH_TOKEN=e2e-token DATABASE_TYPE=sqlite \
   DATABASE_DSN=/tmp/keypool-e2e.db REDIS_ADDR=127.0.0.1:16399 ./keypool &
-python3 scripts/e2e/e2e_test.py   # 28 个场景：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡/渠道元数据/PATCH 启停
+python3 scripts/e2e/e2e_test.py   # 33 项断言：轮询均匀/禁用写穿/全灭联动/恢复/幂等/epoch/轮换/usage 均衡/渠道全量元数据/PATCH 启停
 ```
 
 ## Docker Compose 部署（只跑 keypool 薄服务）

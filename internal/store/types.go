@@ -64,20 +64,40 @@ func (ci *ChannelInfo) Scan(value interface{}) error {
 }
 
 // Channel maps the new-api channels table columns used by keypool (SPEC §2.1).
+// 列名/gorm tag 逐字节对齐 new-api model.Channel，便于元数据投影全量透出。
+// 注意：keypool 仅读取这些列；写路径（ApplyKeyStatus）只 Updates
+// channel_info/status/other_info 三列（single-writer discipline，SPEC §2.3）。
 type Channel struct {
-	Id          int         `json:"id"`
-	Type        int         `json:"type" gorm:"default:0"`
-	Key         string      `json:"key" gorm:"not null"`
-	Status      int         `json:"status" gorm:"default:1"`
-	Name        string      `json:"name" gorm:"index"`
-	Weight      *uint       `json:"weight" gorm:"default:0"`
-	BaseURL     string      `json:"base_url" gorm:"column:base_url;default:''"`
-	Models      string      `json:"models"`
-	Group       string      `json:"group" gorm:"column:group;type:varchar(64);default:'default'"`
-	Priority    *int64      `json:"priority" gorm:"bigint;default:0"`
-	AutoBan     *int        `json:"auto_ban" gorm:"default:1"`
-	OtherInfo   string      `json:"other_info"`
-	ChannelInfo ChannelInfo `json:"channel_info" gorm:"type:json"`
+	Id                 int         `json:"id"`
+	Type               int         `json:"type" gorm:"default:0"`
+	Key                string      `json:"key" gorm:"not null"`
+	OpenAIOrganization *string     `json:"openai_organization"`
+	TestModel          *string     `json:"test_model"`
+	Status             int         `json:"status" gorm:"default:1"`
+	Name               string      `json:"name" gorm:"index"`
+	Weight             *uint       `json:"weight" gorm:"default:0"`
+	CreatedTime        int64       `json:"created_time" gorm:"bigint"`
+	TestTime           int64       `json:"test_time" gorm:"bigint"`
+	ResponseTime       int         `json:"response_time"` // in milliseconds
+	BaseURL            string      `json:"base_url" gorm:"column:base_url;default:''"`
+	Other              string      `json:"other"`
+	Balance            float64     `json:"balance"` // in USD
+	BalanceUpdatedTime int64       `json:"balance_updated_time" gorm:"bigint"`
+	Models             string      `json:"models"`
+	Group              string      `json:"group" gorm:"column:group;type:varchar(64);default:'default'"`
+	UsedQuota          int64       `json:"used_quota" gorm:"bigint;default:0"`
+	ModelMapping       *string     `json:"model_mapping" gorm:"type:text"`
+	StatusCodeMapping  *string     `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
+	Priority           *int64      `json:"priority" gorm:"bigint;default:0"`
+	AutoBan            *int        `json:"auto_ban" gorm:"default:1"`
+	OtherInfo          string      `json:"other_info"`
+	Tag                *string     `json:"tag" gorm:"index"`
+	Setting            *string     `json:"setting" gorm:"type:text"` // 渠道额外设置
+	ParamOverride      *string     `json:"param_override" gorm:"type:text"`
+	HeaderOverride     *string     `json:"header_override" gorm:"type:text"` // 自定义请求标头
+	Remark             *string     `json:"remark" gorm:"type:varchar(255)"`
+	ChannelInfo        ChannelInfo `json:"channel_info" gorm:"type:json"`
+	OtherSettings      string      `json:"settings" gorm:"column:settings"` // azure 版本等（dto.ChannelOtherSettings）
 }
 
 // TableName binds Channel to new-api's channels table.
@@ -126,12 +146,19 @@ func (c *Channel) EnabledKeyIndexes() []int {
 // ChannelMeta 是面向调用方的渠道元数据只读投影（new-api channels 表）。
 // 供 key 选取接口（include_channel）与 GET /v1/channels/{id} 返回，
 // 便于对接方无需直连 DB 即可拿到渠道上下文。
+//
+// 除基础字段外，JSON 字符串列（model_mapping/status_code_mapping/
+// header_override/param_override/setting/settings/other/other_info）
+// 解析为对象透出，解析失败或为空时省略。注意 header_override/param_override
+// 等可能包含敏感配置，接口本身由 AUTH_TOKEN 保护。
 type ChannelMeta struct {
 	ID           int      `json:"id"`
 	Name         string   `json:"name"`
 	Type         int      `json:"type"`
 	Status       int      `json:"status"` // 1=enabled 2=manually_disabled 3=auto_disabled
 	Group        string   `json:"group"`
+	Tag          string   `json:"tag,omitempty"`
+	Remark       string   `json:"remark,omitempty"`
 	Models       []string `json:"models"`
 	BaseURL      string   `json:"base_url"`
 	Priority     int64    `json:"priority"`
@@ -140,7 +167,63 @@ type ChannelMeta struct {
 	MultiKey     bool     `json:"multi_key"`
 	MultiKeyMode string   `json:"multi_key_mode"` // 多 key 渠道缺省按 polling 报告
 	KeyCount     int      `json:"key_count"`
-	Epoch        string   `json:"epoch"`
+	// EnabledKeyCount 为当前启用 key 数（multi_key_status_list 缺失即启用）。
+	EnabledKeyCount int    `json:"enabled_key_count"`
+	Epoch           string `json:"epoch"`
+
+	// ---- 上游运维/测试信息 ----
+	OpenAIOrganization string  `json:"openai_organization,omitempty"`
+	TestModel          string  `json:"test_model,omitempty"`
+	CreatedTime        int64   `json:"created_time,omitempty"`         // unix 秒
+	TestTime           int64   `json:"test_time,omitempty"`            // 上次测活时间，unix 秒
+	ResponseTime       int     `json:"response_time,omitempty"`        // 上次测活耗时，毫秒
+	Balance            float64 `json:"balance,omitempty"`              // 余额（USD）
+	BalanceUpdatedTime int64   `json:"balance_updated_time,omitempty"` // unix 秒
+	UsedQuota          int64   `json:"used_quota,omitempty"`           // 已用额度
+
+	// ---- 覆盖/映射配置（JSON 列解析后透出）----
+	ModelMapping      map[string]string `json:"model_mapping,omitempty"`       // 模型重定向
+	StatusCodeMapping map[string]string `json:"status_code_mapping,omitempty"` // 状态码重定向
+	HeaderOverride    map[string]string `json:"header_override,omitempty"`     // 自定义请求标头
+	ParamOverride     map[string]any    `json:"param_override,omitempty"`      // 请求体参数覆盖
+	Setting           map[string]any    `json:"setting,omitempty"`             // 渠道额外设置
+	Settings          map[string]any    `json:"settings,omitempty"`            // azure 版本等（settings 列）
+	Other             map[string]any    `json:"other,omitempty"`               // 旧版 other 配置
+	OtherInfo         map[string]any    `json:"other_info,omitempty"`          // status_reason/status_time 等
+}
+
+// parseStringMap 把 new-api 的 JSON 字符串列解析为 map[string]string
+// （model_mapping/status_code_mapping/header_override）。空值或解析失败返回 nil。
+func parseStringMap(s *string) map[string]string {
+	if s == nil || strings.TrimSpace(*s) == "" {
+		return nil
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal([]byte(*s), &m); err != nil || len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// parseObjectMap 把 JSON 字符串解析为 map[string]any
+// （param_override/setting/settings/other/other_info）。空值或解析失败返回 nil。
+func parseObjectMap(s string) map[string]any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	m := map[string]any{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil || len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// deref 安全解引用 *string。
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // Meta 构造 Channel 的元数据投影。
@@ -164,20 +247,39 @@ func (c *Channel) Meta() *ChannelMeta {
 		mode = "polling"
 	}
 	return &ChannelMeta{
-		ID:           c.Id,
-		Name:         c.Name,
-		Type:         c.Type,
-		Status:       c.Status,
-		Group:        c.Group,
-		Models:       models,
-		BaseURL:      c.BaseURL,
-		Priority:     priority,
-		Weight:       weight,
-		AutoBan:      c.AutoBan == nil || *c.AutoBan == 1,
-		MultiKey:     c.ChannelInfo.IsMultiKey,
-		MultiKeyMode: mode,
-		KeyCount:     len(c.GetKeys()),
-		Epoch:        c.Epoch(),
+		ID:                 c.Id,
+		Name:               c.Name,
+		Type:               c.Type,
+		Status:             c.Status,
+		Group:              c.Group,
+		Tag:                deref(c.Tag),
+		Remark:             deref(c.Remark),
+		Models:             models,
+		BaseURL:            c.BaseURL,
+		Priority:           priority,
+		Weight:             weight,
+		AutoBan:            c.AutoBan == nil || *c.AutoBan == 1,
+		MultiKey:           c.ChannelInfo.IsMultiKey,
+		MultiKeyMode:       mode,
+		KeyCount:           len(c.GetKeys()),
+		EnabledKeyCount:    len(c.EnabledKeyIndexes()),
+		Epoch:              c.Epoch(),
+		OpenAIOrganization: deref(c.OpenAIOrganization),
+		TestModel:          deref(c.TestModel),
+		CreatedTime:        c.CreatedTime,
+		TestTime:           c.TestTime,
+		ResponseTime:       c.ResponseTime,
+		Balance:            c.Balance,
+		BalanceUpdatedTime: c.BalanceUpdatedTime,
+		UsedQuota:          c.UsedQuota,
+		ModelMapping:       parseStringMap(c.ModelMapping),
+		StatusCodeMapping:  parseStringMap(c.StatusCodeMapping),
+		HeaderOverride:     parseStringMap(c.HeaderOverride),
+		ParamOverride:      parseObjectMap(deref(c.ParamOverride)),
+		Setting:            parseObjectMap(deref(c.Setting)),
+		Settings:           parseObjectMap(c.OtherSettings),
+		Other:              parseObjectMap(c.Other),
+		OtherInfo:          parseObjectMap(c.OtherInfo),
 	}
 }
 

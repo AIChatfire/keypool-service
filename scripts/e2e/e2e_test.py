@@ -192,6 +192,7 @@ meta = b["data"].get("channel") or {}
 check("T16 select include_channel meta", s == 200 and meta.get("id") == 12
       and meta.get("name") == "multi5" and meta.get("multi_key") is True
       and meta.get("key_count") == 5 and "gpt-4o" in (meta.get("models") or [])
+      and 1 <= (meta.get("enabled_key_count") or 0) <= 5
       and meta.get("epoch") == b["data"]["epoch"], meta)
 # 默认不附带
 s, b = call("POST", "/v1/keys/select", {"channel_id": 12})
@@ -203,6 +204,20 @@ m13 = b["data"]
 check("T17 channel meta endpoint", s == 200 and m13.get("name") == "single"
       and m13.get("multi_key") is False and m13.get("priority") == 5
       and m13.get("models") == ["gpt-4o"], m13)
+# T17c 全量元数据：标头覆盖/模型映射/参数覆盖/渠道设置/余额/测活等
+check("T17c channel meta full projection",
+      m13.get("tag") == "paid" and m13.get("remark") == "e2e 全量元数据"
+      and m13.get("openai_organization") == "org-e2e" and m13.get("test_model") == "gpt-4o"
+      and m13.get("header_override", {}).get("X-Custom-Header") == "e2e"
+      and m13.get("model_mapping", {}).get("gpt-4o") == "gpt-4o-2024-08-06"
+      and m13.get("status_code_mapping", {}).get("503") == "500"
+      and m13.get("param_override", {}).get("temperature") == 0.5
+      and m13.get("setting", {}).get("proxy") == "http://127.0.0.1:7890"
+      and m13.get("settings", {}).get("azure_api_version") == "2024-08-01-preview"
+      and m13.get("other", {}).get("region") == "us"
+      and m13.get("balance") == 12.5 and m13.get("used_quota") == 12345
+      and m13.get("created_time") == 1700000000 and m13.get("test_time") == 1700000100
+      and m13.get("response_time") == 233 and m13.get("enabled_key_count") == 1, m13)
 s, b = call("GET", "/v1/channels/999")
 check("T17b unknown channel -> 404/40002", s == 404 and b.get("code") == 40002, (s, b.get("code")))
 
