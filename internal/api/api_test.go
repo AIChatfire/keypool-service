@@ -475,8 +475,8 @@ func TestGetChannelMeta(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if meta.ID != 7 || meta.Name != "upstream-a" || meta.Priority != 5 || meta.Weight != 3 ||
-		!meta.MultiKey || meta.MultiKeyMode != "random" || meta.KeyCount != 2 ||
-		len(meta.Models) != 2 || meta.Models[1] != "gpt-4o-mini" || !meta.AutoBan || meta.Epoch == "" {
+		!meta.MultiKey || meta.MultiKeyMode != "random" ||
+		len(meta.Models) != 2 || meta.Models[1] != "gpt-4o-mini" || !meta.AutoBan {
 		t.Fatalf("meta=%+v", meta)
 	}
 
@@ -506,7 +506,7 @@ func TestSelectIncludeChannel(t *testing.T) {
 
 	// selector 返回元数据 → 响应透传
 	sl2 := okSelector()
-	sl2.resp.Channel = &store.ChannelMeta{ID: 7, Name: "upstream-a", MultiKey: true, KeyCount: 2}
+	sl2.resp.Channel = &store.ChannelMeta{ID: 7, Name: "upstream-a", MultiKey: true, MultiKeyMode: "polling"}
 	h2 := newTestRouter(sl2, okManager(), &fakeStore{}, &fakeProvider{}, nil)
 	status, env = do(t, h2, authed(httptest.NewRequest("POST", "/v1/keys/select",
 		strings.NewReader(`{"channel_id":7,"include_channel":true}`))))

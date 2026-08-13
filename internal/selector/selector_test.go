@@ -529,7 +529,7 @@ func TestSelectIncludeChannelMeta(t *testing.T) {
 		t.Fatalf("Channel meta missing")
 	}
 	if meta.ID != 7 || meta.Name != "upstream-a" || !meta.MultiKey || meta.MultiKeyMode != "polling" ||
-		meta.KeyCount != 2 || len(meta.Models) != 2 || meta.Epoch != ch.Epoch() {
+		len(meta.Models) != 2 {
 		t.Fatalf("meta = %+v", meta)
 	}
 }

@@ -329,7 +329,8 @@ func TestUpsertOptionPrefixGuard(t *testing.T) {
 	}
 }
 
-// Meta 投影：nil 指针字段安全、models 切分、多 key 缺省 mode、epoch。
+// Meta 投影：nil 指针字段安全、models 切分、多 key 缺省 mode。
+// 投影只含 Web 可配置字段，key_count/epoch 等运行态字段不在其中。
 func TestChannelMeta(t *testing.T) {
 	ch := &Channel{
 		Id: 9, Type: 1, Status: 1, Name: "n", Key: "a\nb\nc",
@@ -343,15 +344,12 @@ func TestChannelMeta(t *testing.T) {
 	if m.MultiKeyMode != "polling" { // 多 key 且未设 mode → polling
 		t.Fatalf("mode = %q", m.MultiKeyMode)
 	}
-	if m.KeyCount != 3 || len(m.Models) != 2 || m.Models[1] != "gpt-4o-mini" {
+	if len(m.Models) != 2 || m.Models[1] != "gpt-4o-mini" {
 		t.Fatalf("meta = %+v", m)
-	}
-	if m.Epoch != ch.Epoch() || m.Epoch == "" {
-		t.Fatalf("epoch = %q", m.Epoch)
 	}
 
 	single := &Channel{Id: 1, Key: "sk-x", ChannelInfo: ChannelInfo{IsMultiKey: false}}
-	if sm := single.Meta(); sm.MultiKey || sm.MultiKeyMode != "" || sm.KeyCount != 1 {
+	if sm := single.Meta(); sm.MultiKey || sm.MultiKeyMode != "" {
 		t.Fatalf("single meta = %+v", sm)
 	}
 }

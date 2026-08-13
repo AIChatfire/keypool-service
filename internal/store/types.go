@@ -147,10 +147,11 @@ func (c *Channel) EnabledKeyIndexes() []int {
 // 供 key 选取接口（include_channel）与 GET /v1/channels/{id} 返回，
 // 便于对接方无需直连 DB 即可拿到渠道上下文。
 //
-// 除基础字段外，JSON 字符串列（model_mapping/status_code_mapping/
-// header_override/param_override/setting/settings/other/other_info）
-// 解析为对象透出，解析失败或为空时省略。注意 header_override/param_override
-// 等可能包含敏感配置，接口本身由 AUTH_TOKEN 保护。
+// 只透出 new-api 后台 Web 端可配置的信息（渠道编辑表单项），
+// 不含运行时/统计态字段（测活结果、余额、已用额度、禁用原因、key 数、epoch 等）。
+// JSON 字符串列（model_mapping/status_code_mapping/header_override/
+// param_override/setting/settings/other）解析为对象透出，解析失败或为空时省略。
+// 注意 header_override/param_override 等可能包含敏感配置，接口本身由 AUTH_TOKEN 保护。
 type ChannelMeta struct {
 	ID           int      `json:"id"`
 	Name         string   `json:"name"`
@@ -166,30 +167,19 @@ type ChannelMeta struct {
 	AutoBan      bool     `json:"auto_ban"`
 	MultiKey     bool     `json:"multi_key"`
 	MultiKeyMode string   `json:"multi_key_mode"` // 多 key 渠道缺省按 polling 报告
-	KeyCount     int      `json:"key_count"`
-	// EnabledKeyCount 为当前启用 key 数（multi_key_status_list 缺失即启用）。
-	EnabledKeyCount int    `json:"enabled_key_count"`
-	Epoch           string `json:"epoch"`
 
-	// ---- 上游运维/测试信息 ----
-	OpenAIOrganization string  `json:"openai_organization,omitempty"`
-	TestModel          string  `json:"test_model,omitempty"`
-	CreatedTime        int64   `json:"created_time,omitempty"`         // unix 秒
-	TestTime           int64   `json:"test_time,omitempty"`            // 上次测活时间，unix 秒
-	ResponseTime       int     `json:"response_time,omitempty"`        // 上次测活耗时，毫秒
-	Balance            float64 `json:"balance,omitempty"`              // 余额（USD）
-	BalanceUpdatedTime int64   `json:"balance_updated_time,omitempty"` // unix 秒
-	UsedQuota          int64   `json:"used_quota,omitempty"`           // 已用额度
+	// ---- Web 端可配置的上游参数 ----
+	OpenAIOrganization string `json:"openai_organization,omitempty"`
+	TestModel          string `json:"test_model,omitempty"` // 测活模型
 
 	// ---- 覆盖/映射配置（JSON 列解析后透出）----
 	ModelMapping      map[string]string `json:"model_mapping,omitempty"`       // 模型重定向
-	StatusCodeMapping map[string]string `json:"status_code_mapping,omitempty"` // 状态码重定向
+	StatusCodeMapping map[string]string `json:"status_code_mapping,omitempty"` // 状态码覆盖
 	HeaderOverride    map[string]string `json:"header_override,omitempty"`     // 自定义请求标头
 	ParamOverride     map[string]any    `json:"param_override,omitempty"`      // 请求体参数覆盖
-	Setting           map[string]any    `json:"setting,omitempty"`             // 渠道额外设置
+	Setting           map[string]any    `json:"setting,omitempty"`             // 渠道额外设置（代理等）
 	Settings          map[string]any    `json:"settings,omitempty"`            // azure 版本等（settings 列）
-	Other             map[string]any    `json:"other,omitempty"`               // 旧版 other 配置
-	OtherInfo         map[string]any    `json:"other_info,omitempty"`          // status_reason/status_time 等
+	Other             map[string]any    `json:"other,omitempty"`               // 其他设置（Vertex 部署地区等）
 }
 
 // parseStringMap 把 new-api 的 JSON 字符串列解析为 map[string]string
@@ -261,17 +251,8 @@ func (c *Channel) Meta() *ChannelMeta {
 		AutoBan:            c.AutoBan == nil || *c.AutoBan == 1,
 		MultiKey:           c.ChannelInfo.IsMultiKey,
 		MultiKeyMode:       mode,
-		KeyCount:           len(c.GetKeys()),
-		EnabledKeyCount:    len(c.EnabledKeyIndexes()),
-		Epoch:              c.Epoch(),
 		OpenAIOrganization: deref(c.OpenAIOrganization),
 		TestModel:          deref(c.TestModel),
-		CreatedTime:        c.CreatedTime,
-		TestTime:           c.TestTime,
-		ResponseTime:       c.ResponseTime,
-		Balance:            c.Balance,
-		BalanceUpdatedTime: c.BalanceUpdatedTime,
-		UsedQuota:          c.UsedQuota,
 		ModelMapping:       parseStringMap(c.ModelMapping),
 		StatusCodeMapping:  parseStringMap(c.StatusCodeMapping),
 		HeaderOverride:     parseStringMap(c.HeaderOverride),
@@ -279,7 +260,6 @@ func (c *Channel) Meta() *ChannelMeta {
 		Setting:            parseObjectMap(deref(c.Setting)),
 		Settings:           parseObjectMap(c.OtherSettings),
 		Other:              parseObjectMap(c.Other),
-		OtherInfo:          parseObjectMap(c.OtherInfo),
 	}
 }
 
