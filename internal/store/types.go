@@ -173,30 +173,21 @@ type ChannelMeta struct {
 	TestModel          string `json:"test_model,omitempty"` // 测活模型
 
 	// ---- 覆盖/映射配置（JSON 列解析后透出）----
-	ModelMapping      map[string]string `json:"model_mapping,omitempty"`       // 模型重定向
-	StatusCodeMapping map[string]string `json:"status_code_mapping,omitempty"` // 状态码覆盖
-	HeaderOverride    map[string]string `json:"header_override,omitempty"`     // 自定义请求标头
-	ParamOverride     map[string]any    `json:"param_override,omitempty"`      // 请求体参数覆盖
-	Setting           map[string]any    `json:"setting,omitempty"`             // 渠道额外设置（代理等）
-	Settings          map[string]any    `json:"settings,omitempty"`            // azure 版本等（settings 列）
-	Other             map[string]any    `json:"other,omitempty"`               // 其他设置（Vertex 部署地区等）
-}
-
-// parseStringMap 把 new-api 的 JSON 字符串列解析为 map[string]string
-// （model_mapping/status_code_mapping/header_override）。空值或解析失败返回 nil。
-func parseStringMap(s *string) map[string]string {
-	if s == nil || strings.TrimSpace(*s) == "" {
-		return nil
-	}
-	m := map[string]string{}
-	if err := json.Unmarshal([]byte(*s), &m); err != nil || len(m) == 0 {
-		return nil
-	}
-	return m
+	// 用 map[string]any 原样透出：线上这些列可能存嵌套对象（如
+	// header_override 存 {"upstream":{...}} 适配配置），按 map[string]string
+	// 解析会整体失败、字段被静默丢弃。
+	ModelMapping      map[string]any `json:"model_mapping,omitempty"`       // 模型重定向
+	StatusCodeMapping map[string]any `json:"status_code_mapping,omitempty"` // 状态码覆盖
+	HeaderOverride    map[string]any `json:"header_override,omitempty"`     // 自定义请求标头（可为嵌套对象）
+	ParamOverride     map[string]any `json:"param_override,omitempty"`      // 请求体参数覆盖
+	Setting           map[string]any `json:"setting,omitempty"`             // 渠道额外设置（代理等）
+	Settings          map[string]any `json:"settings,omitempty"`            // azure 版本等（settings 列）
+	Other             map[string]any `json:"other,omitempty"`               // 其他设置（Vertex 部署地区等）
 }
 
 // parseObjectMap 把 JSON 字符串解析为 map[string]any
-// （param_override/setting/settings/other/other_info）。空值或解析失败返回 nil。
+// （model_mapping/status_code_mapping/header_override/param_override/
+// setting/settings/other/other_info）。空值或解析失败返回 nil。
 func parseObjectMap(s string) map[string]any {
 	if strings.TrimSpace(s) == "" {
 		return nil
@@ -297,9 +288,9 @@ func (c *Channel) Meta() *ChannelMeta {
 		MultiKeyMode:       mode,
 		OpenAIOrganization: deref(c.OpenAIOrganization),
 		TestModel:          deref(c.TestModel),
-		ModelMapping:       parseStringMap(c.ModelMapping),
-		StatusCodeMapping:  parseStringMap(c.StatusCodeMapping),
-		HeaderOverride:     parseStringMap(c.HeaderOverride),
+		ModelMapping:       parseObjectMap(deref(c.ModelMapping)),
+		StatusCodeMapping:  parseObjectMap(deref(c.StatusCodeMapping)),
+		HeaderOverride:     parseObjectMap(deref(c.HeaderOverride)),
 		ParamOverride:      parseObjectMap(deref(c.ParamOverride)),
 		Setting:            pruneZeroEntries(parseObjectMap(deref(c.Setting))),
 		Settings:           pruneZeroEntries(parseObjectMap(c.OtherSettings)),

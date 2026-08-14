@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -423,6 +424,23 @@ func TestChannelMetaOverrideMaps(t *testing.T) {
 	bare := &Channel{Id: 7, Key: "sk-x"}
 	if bm := bare.Meta(); bm.HeaderOverride != nil || bm.ModelMapping != nil || bm.StatusCodeMapping != nil {
 		t.Fatalf("unset override columns should be omitted: %+v", bm)
+	}
+}
+
+// 线上回归：header_override 存的是嵌套 JSON 对象（如渠道适配配置
+// {"upstream":{"biz":"minimax",...}}），按 map[string]string 解析会整体失败、
+// 字段被静默丢弃——投影必须按通用对象原样透出。
+func TestChannelMetaNestedHeaderOverride(t *testing.T) {
+	nested := `{"upstream":{"biz":"minimax","submit_path":"/v2/video_generation","billing":{"type":"second","price":[]}},"X-Custom":"v"}`
+	ch := &Channel{Id: 8, Key: "sk-x", HeaderOverride: &nested}
+	m := ch.Meta()
+
+	var want map[string]any
+	if err := json.Unmarshal([]byte(nested), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(m.HeaderOverride, want) {
+		t.Fatalf("nested header_override dropped or mangled:\n got %v\nwant %v", m.HeaderOverride, want)
 	}
 }
 
