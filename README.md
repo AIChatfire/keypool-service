@@ -166,7 +166,11 @@ curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d
 运行态/统计字段（`created_time` `test_time` `response_time` `balance`
 `used_quota` `other_info` `key_count` `epoch` 等）**不返回**；
 `epoch` 仍由 select 响应顶层携带。JSON 字符串列均解析为对象透出，
-为空或解析失败时该字段省略。
+为空或解析失败时该字段省略；其中 `setting`/`settings`/`other` 只透出
+**非默认值**的配置项——new-api 落库时会把这两列按类型化 struct 全量
+序列化（带满 `false`/`""`/`0` 默认值），投影层已剔除零值噪声，剔除后
+无剩余项则字段整体省略。`param_override` 为用户手填 JSON，显式
+`0`/`false` 有语义（如 `"temperature":0`），原样透出。
 **注意**：`header_override`/`param_override` 等可能含敏感配置，接口由 `AUTH_TOKEN` 保护，按需授权。
 
 - `band` 仅启用批次轮换时出现；`lease_id` 仅 usage 模式且 `est_tokens>0` 时出现；

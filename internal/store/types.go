@@ -208,6 +208,50 @@ func parseObjectMap(s string) map[string]any {
 	return m
 }
 
+// pruneZeroEntries 剔除 map 中的零值项（nil/false/""/0/空数组/空对象），
+// 全部剔除后返回 nil（该字段整体省略）。
+//
+// 背景：new-api 落库时把 setting/settings 两列按类型化 struct 全量序列化
+// （无 omitempty），DB 里存的是带全部默认值的 JSON；原样透出会在响应里
+// flood 一堆 false/""/0 噪声。投影只保留非默认（即用户实际配置）的项，
+// 对齐 README 承诺的"只透出 Web 端可配置信息"语义。
+// 注意：param_override 不走此函数——它是用户手填 JSON，显式 0/false
+// 有语义（如 "temperature":0），必须原样透出。
+func pruneZeroEntries(m map[string]any) map[string]any {
+	for k, v := range m {
+		if isZeroValue(v) {
+			delete(m, k)
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// isZeroValue 判定 JSON 反序列化后的值是否为零值。
+func isZeroValue(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !t
+	case string:
+		return t == ""
+	case float64: // encoding/json 数字统一为 float64
+		return t == 0
+	case int:
+		return t == 0
+	case int64:
+		return t == 0
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
+}
+
 // deref 安全解引用 *string。
 func deref(s *string) string {
 	if s == nil {
@@ -257,9 +301,9 @@ func (c *Channel) Meta() *ChannelMeta {
 		StatusCodeMapping:  parseStringMap(c.StatusCodeMapping),
 		HeaderOverride:     parseStringMap(c.HeaderOverride),
 		ParamOverride:      parseObjectMap(deref(c.ParamOverride)),
-		Setting:            parseObjectMap(deref(c.Setting)),
-		Settings:           parseObjectMap(c.OtherSettings),
-		Other:              parseObjectMap(c.Other),
+		Setting:            pruneZeroEntries(parseObjectMap(deref(c.Setting))),
+		Settings:           pruneZeroEntries(parseObjectMap(c.OtherSettings)),
+		Other:              pruneZeroEntries(parseObjectMap(c.Other)),
 	}
 }
 

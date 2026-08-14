@@ -354,6 +354,45 @@ func TestChannelMeta(t *testing.T) {
 	}
 }
 
+// Meta 投影的零值剔除：new-api 把 setting/settings 按类型化 struct 全量落库，
+// 投影必须剔除默认零值项（false/""/0/空数组），只透出实际配置；全零则字段省略。
+// param_override 是用户手填 JSON，显式零值有语义，原样保留。
+func TestChannelMetaPruneZeroEntries(t *testing.T) {
+	setting := `{"force_format":false,"proxy":"http://127.0.0.1:7890","system_prompt":"","thinking_to_content":false}`
+	settings := `{"allow_service_tier":false,"disable_store":false,"upstream_model_update_ignored_models":[],"upstream_model_update_last_check_time":0,"azure_api_version":"2024-08-01-preview"}`
+	other := `{"region":"us","empty_list":[],"note":""}`
+	paramOverride := `{"temperature":0,"stream":false,"max_tokens":512}`
+
+	ch := &Channel{
+		Id: 4, Key: "sk-x",
+		Setting:       &setting,
+		OtherSettings: settings,
+		Other:         other,
+		ParamOverride: &paramOverride,
+	}
+	m := ch.Meta()
+
+	if len(m.Setting) != 1 || m.Setting["proxy"] != "http://127.0.0.1:7890" {
+		t.Fatalf("setting = %v, want only proxy kept", m.Setting)
+	}
+	if len(m.Settings) != 1 || m.Settings["azure_api_version"] != "2024-08-01-preview" {
+		t.Fatalf("settings = %v, want only azure_api_version kept", m.Settings)
+	}
+	if len(m.Other) != 1 || m.Other["region"] != "us" {
+		t.Fatalf("other = %v, want only region kept", m.Other)
+	}
+	if len(m.ParamOverride) != 3 { // 显式 0/false 必须保留
+		t.Fatalf("param_override = %v, want all 3 entries kept verbatim", m.ParamOverride)
+	}
+
+	// 全零值 → 字段整体省略（nil）
+	zeroSetting := `{"force_format":false,"proxy":""}`
+	zc := &Channel{Id: 5, Key: "sk-x", Setting: &zeroSetting}
+	if zm := zc.Meta(); zm.Setting != nil {
+		t.Fatalf("all-zero setting should be omitted, got %v", zm.Setting)
+	}
+}
+
 // ApplyKeyStatus 在 sqlite（无行锁方言）下行为不变——rowLockSupported 跳过分支。
 func TestRowLockDialectGate(t *testing.T) {
 	s := newTestStore(t)
