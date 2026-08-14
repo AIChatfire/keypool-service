@@ -393,6 +393,39 @@ func TestChannelMetaPruneZeroEntries(t *testing.T) {
 	}
 }
 
+// Meta 投影的覆盖/映射列透出：model_mapping/status_code_mapping/header_override
+// 是 new-api 的独立 JSON 字符串列（已核对上游 model.Channel 定义），
+// 配置了就必须出现在元数据里——回归"线上响应缺 header_override"。
+func TestChannelMetaOverrideMaps(t *testing.T) {
+	modelMapping := `{"gpt-4o":"gpt-4o-2024-08-06"}`
+	statusCodeMapping := `{"503":"500"}`
+	headerOverride := `{"X-Custom-Header":"v"}`
+
+	ch := &Channel{
+		Id: 6, Key: "sk-x",
+		ModelMapping:      &modelMapping,
+		StatusCodeMapping: &statusCodeMapping,
+		HeaderOverride:    &headerOverride,
+	}
+	m := ch.Meta()
+
+	if m.ModelMapping["gpt-4o"] != "gpt-4o-2024-08-06" {
+		t.Fatalf("model_mapping = %v", m.ModelMapping)
+	}
+	if m.StatusCodeMapping["503"] != "500" {
+		t.Fatalf("status_code_mapping = %v", m.StatusCodeMapping)
+	}
+	if m.HeaderOverride["X-Custom-Header"] != "v" {
+		t.Fatalf("header_override = %v", m.HeaderOverride)
+	}
+
+	// 未配置（NULL 列）→ 字段省略
+	bare := &Channel{Id: 7, Key: "sk-x"}
+	if bm := bare.Meta(); bm.HeaderOverride != nil || bm.ModelMapping != nil || bm.StatusCodeMapping != nil {
+		t.Fatalf("unset override columns should be omitted: %+v", bm)
+	}
+}
+
 // ApplyKeyStatus 在 sqlite（无行锁方言）下行为不变——rowLockSupported 跳过分支。
 func TestRowLockDialectGate(t *testing.T) {
 	s := newTestStore(t)

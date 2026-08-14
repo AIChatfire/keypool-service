@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """keypool E2E test suite — real sqlite DB + real redis."""
-import json, sqlite3, time, urllib.request, urllib.error, uuid
+import json, os, sqlite3, time, urllib.request, urllib.error, uuid
 
-BASE = "http://127.0.0.1:18099"
+BASE = os.environ.get("E2E_BASE", "http://127.0.0.1:18099")
 TOK = "e2e-token"
-DB = "/tmp/keypool-e2e.db"
+DB = os.environ.get("E2E_DB", "/tmp/keypool-e2e.db")
 results = []
 
 def call(method, path, body=None, token=TOK, idem=None, raw=False):
@@ -33,6 +33,19 @@ def db_ability(cid):
     rows = con.execute("SELECT enabled FROM abilities WHERE channel_id=?", (cid,)).fetchall()
     con.close()
     return [r[0] for r in rows]
+
+def db_retry(fetch, pred, tries=15, delay=0.2):
+    # keypool 跑在容器、本脚本在宿主机直读绑定挂载的 sqlite 文件时，
+    # Docker Desktop 文件共享对容器内提交偶发延迟可见（写路径本身
+    # 同步提交，由 API 响应与单元测试保证）。对宿主机侧 DB 断言做
+    # 短重试，消除环境性 flake，不改变被测语义。
+    val = fetch()
+    for _ in range(tries):
+        if pred(val):
+            return val
+        time.sleep(delay)
+        val = fetch()
+    return val
 
 def check(name, cond, detail=""):
     results.append((name, bool(cond), detail))
@@ -67,7 +80,8 @@ victim = b["data"]["key_index"]
 s, b = call("POST", "/v1/keys/report", {"channel_id": 12, "key_index": victim,
     "success": False, "status_code": 401, "error_message": "Invalid API key provided"})
 check("T4 report 401 -> key_disabled", b["data"]["action"] == "key_disabled", b["data"])
-st, ci, _ = db_channel(12)
+st, ci, _ = db_retry(lambda: db_channel(12),
+                     lambda r: str(victim) in r[1].get("multi_key_status_list", {}))
 check("T4b db status_list[idx]=3 + reason/time", ci["multi_key_status_list"][str(victim)] == 3
       and str(victim) in ci.get("multi_key_disabled_reason", {}), ci)
 
@@ -86,10 +100,11 @@ for _ in range(4):
     _, rb = call("POST", "/v1/keys/report", {"channel_id": 12, "key_index": idx,
         "success": False, "status_code": 401, "error_message": "Invalid API key"})
     acts.append(rb["data"]["action"])
-st, ci, oi = db_channel(12)
+st, ci, oi = db_retry(lambda: db_channel(12), lambda r: r[0] == 3)
+ab12 = db_retry(lambda: db_ability(12), lambda a: all(e == 0 for e in a))
 check("T6 last disable -> channel_disabled", acts[-1] == "channel_disabled", acts)
-check("T6b channel status=3 + abilities off + reason", st == 3 and all(e == 0 for e in db_ability(12))
-      and "All keys are disabled" in oi, (st, db_ability(12), oi))
+check("T6b channel status=3 + abilities off + reason", st == 3 and all(e == 0 for e in ab12)
+      and "All keys are disabled" in oi, (st, ab12, oi))
 s, b = call("POST", "/v1/keys/select", {"channel_id": 12})
 check("T6c keys/select -> 503/40001", s == 503 and b.get("code") == 40001, (s, b.get("code")))
 
@@ -100,16 +115,18 @@ check("T7 group+model picks ch13", b["data"]["channel_id"] == 13 and b["data"]["
 # T8 逐个启用 -> 渠道与 abilities 恢复
 for i in range(5):
     call("PATCH", f"/v1/channels/12/keys/{i}", {"status": "enabled", "reason": "recover"})
-st, ci, _ = db_channel(12)
-check("T8 enable all -> channel+abilities restored", st == 1 and all(e == 1 for e in db_ability(12))
-      and not ci.get("multi_key_status_list"), (st, db_ability(12), ci))
+st, ci, _ = db_retry(lambda: db_channel(12),
+                     lambda r: r[0] == 1 and not r[1].get("multi_key_status_list"))
+ab12 = db_retry(lambda: db_ability(12), lambda a: all(e == 1 for e in a))
+check("T8 enable all -> channel+abilities restored", st == 1 and all(e == 1 for e in ab12)
+      and not ci.get("multi_key_status_list"), (st, ab12, ci))
 
 # T9 非多 key: 自动禁用 -> 成功上报自动启用
 _, b = call("POST", "/v1/keys/report", {"channel_id": 13, "key_index": 0,
     "success": False, "status_code": 401, "error_message": "Invalid API key"})
-st13, _, _ = db_channel(13)
+st13, _, _ = db_retry(lambda: db_channel(13), lambda r: r[0] == 3)
 _, b = call("POST", "/v1/keys/report", {"channel_id": 13, "key_index": 0, "success": True})
-st13b, _, _ = db_channel(13)
+st13b, _, _ = db_retry(lambda: db_channel(13), lambda r: r[0] == 1)
 check("T9 non-multi auto disable/enable", st13 == 3 and b["data"]["action"] == "enabled" and st13b == 1,
       (st13, b["data"], st13b))
 
@@ -228,11 +245,13 @@ check("T17b unknown channel -> 404/40002", s == 404 and b.get("code") == 40002, 
 
 # T18 PATCH 手动禁用/启用 key + 非法 status 校验
 s, b = call("PATCH", "/v1/channels/12/keys/0", {"status": "disabled", "reason": "e2e manual"})
-st, ci, _ = db_channel(12)
+st, ci, _ = db_retry(lambda: db_channel(12),
+                     lambda r: "0" in r[1].get("multi_key_status_list", {}))
 check("T18 PATCH disable -> status_list[0]=2", s == 200 and b["data"]["action"] == "key_disabled"
       and ci["multi_key_status_list"]["0"] == 2, (b["data"], ci.get("multi_key_status_list")))
 s, b = call("PATCH", "/v1/channels/12/keys/0", {"status": "enabled"})
-st, ci, _ = db_channel(12)
+st, ci, _ = db_retry(lambda: db_channel(12),
+                     lambda r: "0" not in r[1].get("multi_key_status_list", {}))
 check("T18b PATCH enable -> removed from status_list", s == 200 and b["data"]["action"] == "enabled"
       and "0" not in ci.get("multi_key_status_list", {}), (b["data"], ci.get("multi_key_status_list")))
 s, b = call("PATCH", "/v1/channels/12/keys/0", {"status": "bogus"})
