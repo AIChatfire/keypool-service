@@ -4,6 +4,10 @@
 // 轮换批次，含 look-ahead）→ Exclude 过滤 → mode 解析 → redisx.SelectKey
 // 单 RTT 取 idx → 组装 SelectResp。
 //
+// 精确直达：SelectReq.KeyIndex 非 nil 时走 selectDirect 短路——在渠道加载后
+// 立即校验索引范围与 key 启用状态并返回，跳过候选集/Exclude/Redis 选 key
+// （零 Redis RTT、不推游标、不做 usage 打分与预扣）。
+//
 // 缓存说明：渠道对象每次 Select 都从 Store 实时读取（DB 级），不引入本地
 // 缓存，保证禁用/启用写穿后立即生效。后续若成为热点，可在 Store 之上加一层
 // 带 TTL/失效通知的渠道快照缓存（由 keypool:events 或 POST /v1/settings/reload
@@ -35,6 +39,9 @@ var (
 	// 非 ErrRecordNotFound 错误、Abilities 错误均包装为它（api 映射
 	// 503/50001），避免把 DB 故障误映射为 404/40002。
 	ErrDependency = errors.New("selector: dependency failure")
+	// ErrInvalidRequest 是参数非法 sentinel（api 映射 400/40010）：
+	// key_index 精确直达的前置校验（缺 channel_id、索引越界）用它。
+	ErrInvalidRequest = errors.New("selector: invalid request")
 )
 
 // SelectReq 是 key 选取请求（SPEC §4，签名一字不改）。
@@ -49,6 +56,12 @@ type SelectReq struct {
 	// IncludeChannel 为 true 时 SelectResp 附带 new-api 渠道元数据
 	//（渠道已在选取流程中加载，零额外 DB 开销）。
 	IncludeChannel bool
+	// KeyIndex 非 nil 时启用「channel_id + key_index 精确直达」：
+	// 跳过候选集构建（轮换批次/exclude）与 Redis 选 key（游标/usage 打分），
+	// 只做索引范围与 key 启用状态校验后直接返回该 key。
+	// 约束：必须与 ChannelID>0 同时给出（否则 ErrInvalidRequest）；
+	// 与 Mode/EstTokens/AdvanceCursor/Exclude 组合时后者一律被忽略。
+	KeyIndex *int
 }
 
 // KeyRef 定位某渠道的一个 key（SPEC §4）。
@@ -130,9 +143,23 @@ func newSelector(ch channelStore, ks keySelector, sp store.SettingsProvider) *Se
 	return sl
 }
 
+// modeDirect 是 key_index 精确直达返回的 mode 标识（非调度模式，
+// 表示"调用方指定索引、未走任何选取算法"）。
+const modeDirect = "direct"
+
 // Select 选取一个可用 key（SPEC §4）。
 func (sl *Selector) Select(ctx context.Context, req SelectReq) (*SelectResp, error) {
 	now := time.Now().Unix()
+
+	// ⓿ key_index 精确直达前置校验：必须搭配 channel_id，索引非负。
+	if req.KeyIndex != nil {
+		if req.ChannelID <= 0 {
+			return nil, fmt.Errorf("%w: key_index requires channel_id", ErrInvalidRequest)
+		}
+		if *req.KeyIndex < 0 {
+			return nil, fmt.Errorf("%w: key_index must be >= 0", ErrInvalidRequest)
+		}
+	}
 
 	// ① 渠道确定
 	ch, err := sl.resolveChannel(req)
@@ -140,6 +167,11 @@ func (sl *Selector) Select(ctx context.Context, req SelectReq) (*SelectResp, err
 		return nil, err
 	}
 	cid := ch.Id
+
+	// ①.5 精确直达：跳过候选集/Exclude/Redis 选 key，只校验索引与启用状态。
+	if req.KeyIndex != nil {
+		return sl.selectDirect(ch, *req.KeyIndex, req)
+	}
 
 	// ② 候选集：EnabledKeyIndexes ∩ 轮换批次（含 look-ahead）
 	st := sl.settings()
@@ -224,6 +256,42 @@ func (sl *Selector) Select(ctx context.Context, req SelectReq) (*SelectResp, err
 	}
 
 	sl.incr(fmt.Sprintf(`select_total{cid="%d",idx="%d"}`, cid, idx), 1)
+	return resp, nil
+}
+
+// selectDirect 实现 channel_id + key_index 精确直达（零 Redis RTT）：
+// 只做索引范围与 key 启用状态校验，直接返回该 key。
+//
+// 语义约定：
+//   - 索引越界（>= len(keys)）→ ErrInvalidRequest（400/40010，永久性错误，
+//     重试无意义；调用方应改走常规选取）。
+//   - key 被禁用（multi_key_status_list[idx] != enabled）→ ErrNoKey
+//     （503/40001，可能被重新启用，语义上可重试）。
+//   - 不推轮询游标、不做 usage 打分/预扣、不签发 lease_id、不返回 band；
+//     mode 固定返回 "direct"，req 的 Mode/EstTokens/AdvanceCursor/Exclude 被忽略。
+func (sl *Selector) selectDirect(ch *store.Channel, idx int, req SelectReq) (*SelectResp, error) {
+	cid := ch.Id
+	keys := ch.GetKeys()
+	if idx >= len(keys) {
+		return nil, fmt.Errorf("%w: key_index %d out of range (channel %d has %d keys)",
+			ErrInvalidRequest, idx, cid, len(keys))
+	}
+	if st, ok := ch.ChannelInfo.MultiKeyStatusList[idx]; ok && st != store.ChannelStatusEnabled {
+		return nil, ErrNoKey // key 被禁用：按无可用 key 处理
+	}
+	resp := &SelectResp{
+		ChannelID: cid,
+		KeyIndex:  idx,
+		Key:       keys[idx],
+		BaseURL:   ch.BaseURL,
+		Mode:      modeDirect,
+		Epoch:     ch.Epoch(),
+	}
+	if req.IncludeChannel {
+		resp.Channel = ch.Meta()
+	}
+	sl.incr(fmt.Sprintf(`select_total{cid="%d",idx="%d"}`, cid, idx), 1)
+	sl.incr("select_direct_total", 1)
 	return resp, nil
 }
 
@@ -390,7 +458,8 @@ func (sl *Selector) incr(key string, delta int64) {
 }
 
 // SnapshotMetrics 返回计数器快照（供 api /metrics 读取）。
-// 键：select_total{cid="X",idx="Y"}、band_lookahead_total。
+// 键：select_total{cid="X",idx="Y"}、band_lookahead_total、
+// select_direct_total（key_index 精确直达命中次数）。
 func (sl *Selector) SnapshotMetrics() map[string]int64 {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()

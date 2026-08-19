@@ -533,3 +533,158 @@ func TestSelectIncludeChannelMeta(t *testing.T) {
 		t.Fatalf("meta = %+v", meta)
 	}
 }
+
+// ---- channel_id + key_index 精确直达 ----
+
+func intPtr(i int) *int { return &i }
+
+// 直达命中：返回指定索引的 key，mode=direct，且完全不调用 Redis 选 key
+// （fakeKeys 未被触达）、不返回 band/lease。
+func TestSelectKeyIndexDirectHit(t *testing.T) {
+	ch := multiKeyChannel(7, []string{"k0", "k1", "k2"}, map[int]int{2: 3})
+	fk := &fakeKeys{ret: 999} // 若被调用会返回 999，用于反证未走 Redis
+	sl := newSelector(&fakeChannels{channels: map[int]*store.Channel{7: ch}}, fk, fakeSP{})
+
+	resp, err := sl.Select(context.Background(), SelectReq{
+		ChannelID: 7, KeyIndex: intPtr(1), AdvanceCursor: true,
+	})
+	if err != nil {
+		t.Fatalf("Select err: %v", err)
+	}
+	if resp.KeyIndex != 1 || resp.Key != "k1" || resp.ChannelID != 7 {
+		t.Fatalf("resp = %+v", resp)
+	}
+	if resp.Mode != modeDirect {
+		t.Fatalf("Mode = %q, want %q", resp.Mode, modeDirect)
+	}
+	if resp.Epoch != ch.Epoch() {
+		t.Fatalf("epoch mismatch")
+	}
+	if resp.Band != nil || resp.LeaseID != "" {
+		t.Fatalf("direct must not return band/lease: %+v", resp)
+	}
+	if fk.candidates != nil || fk.mode != "" {
+		t.Fatalf("direct must not call SelectKey: mode=%q candidates=%v", fk.mode, fk.candidates)
+	}
+	if got := sl.SnapshotMetrics()["select_direct_total"]; got != 1 {
+		t.Fatalf("select_direct_total = %d, want 1", got)
+	}
+
+	// key_index=0 是合法索引（指针语义，不被零值遮蔽）
+	resp, err = sl.Select(context.Background(), SelectReq{ChannelID: 7, KeyIndex: intPtr(0)})
+	if err != nil || resp.KeyIndex != 0 || resp.Key != "k0" {
+		t.Fatalf("index 0: resp=%+v err=%v", resp, err)
+	}
+}
+
+// 直达绕过轮换批次：轮换配置下当前 band 不含目标索引，直达仍命中。
+func TestSelectKeyIndexDirectBypassesRotation(t *testing.T) {
+	band := time.Now().Unix() / 60
+	cur := int(band % 4)
+	other := (cur + 2) % 4 // 一定不在当前 band 的批次里（ActiveCount=1）
+	ch := multiKeyChannel(8, []string{"k0", "k1", "k2", "k3"}, nil)
+	st := &store.Settings{Rotation: map[int]store.RotationCfg{
+		8: {BandSeconds: 60, ActiveCount: 1, Order: "index"},
+	}}
+	sl := newSelector(&fakeChannels{channels: map[int]*store.Channel{8: ch}}, &fakeKeys{ret: cur}, fakeSP{st})
+
+	resp, err := sl.Select(context.Background(), SelectReq{ChannelID: 8, KeyIndex: intPtr(other)})
+	if err != nil {
+		t.Fatalf("Select err: %v", err)
+	}
+	if resp.KeyIndex != other || resp.Band != nil {
+		t.Fatalf("direct should bypass rotation: resp=%+v (cur band idx=%d)", resp, cur)
+	}
+}
+
+// 直达忽略 exclude / mode / est_tokens：这些参数在直达路径无效。
+func TestSelectKeyIndexDirectIgnoresSchedulingParams(t *testing.T) {
+	ch := multiKeyChannel(6, []string{"k0", "k1"}, nil)
+	fk := &fakeKeys{ret: 0, leases: map[string]float64{}}
+	st := &store.Settings{Balance: map[int]store.BalanceCfg{
+		6: {Mode: "usage", Metric: "tokens"},
+	}}
+	sl := newSelector(&fakeChannels{channels: map[int]*store.Channel{6: ch}}, fk, fakeSP{st})
+
+	resp, err := sl.Select(context.Background(), SelectReq{
+		ChannelID: 6, KeyIndex: intPtr(1),
+		Exclude:   []KeyRef{{ChannelID: 6, KeyIndex: 1}}, // 被忽略
+		Mode:      "usage",
+		EstTokens: 512, // 不预扣、不签发租约
+	})
+	if err != nil {
+		t.Fatalf("Select err: %v", err)
+	}
+	if resp.KeyIndex != 1 || resp.Mode != modeDirect {
+		t.Fatalf("resp = %+v", resp)
+	}
+	if resp.LeaseID != "" || fk.leaseSets != 0 {
+		t.Fatalf("direct must not lease: lease_id=%q sets=%d", resp.LeaseID, fk.leaseSets)
+	}
+}
+
+// 直达的错误语义：越界 → ErrInvalidRequest（400）；被禁用 → ErrNoKey（503）；
+// 缺 channel_id / 负索引 → ErrInvalidRequest；渠道不存在 → ErrNoChannel。
+func TestSelectKeyIndexDirectErrors(t *testing.T) {
+	ch := multiKeyChannel(7, []string{"k0", "k1", "k2"}, map[int]int{2: 3})
+	sl := newSelector(&fakeChannels{channels: map[int]*store.Channel{7: ch}}, &fakeKeys{}, fakeSP{})
+	ctx := context.Background()
+
+	// 越界 → ErrInvalidRequest（永久性错误，重试无意义）
+	_, err := sl.Select(ctx, SelectReq{ChannelID: 7, KeyIndex: intPtr(9)})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("out of range err = %v, want ErrInvalidRequest", err)
+	}
+	if errors.Is(err, ErrNoKey) {
+		t.Fatalf("out of range must not be ErrNoKey: %v", err)
+	}
+
+	// 被禁用的 key → ErrNoKey（可能被重新启用，语义可重试）
+	_, err = sl.Select(ctx, SelectReq{ChannelID: 7, KeyIndex: intPtr(2)})
+	if !errors.Is(err, ErrNoKey) {
+		t.Fatalf("disabled key err = %v, want ErrNoKey", err)
+	}
+
+	// 缺 channel_id（走 group+model）→ ErrInvalidRequest
+	_, err = sl.Select(ctx, SelectReq{Group: "default", Model: "gpt-x", KeyIndex: intPtr(0)})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("missing channel_id err = %v, want ErrInvalidRequest", err)
+	}
+
+	// 负索引 → ErrInvalidRequest
+	_, err = sl.Select(ctx, SelectReq{ChannelID: 7, KeyIndex: intPtr(-1)})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("negative index err = %v, want ErrInvalidRequest", err)
+	}
+
+	// 渠道不存在 → ErrNoChannel（渠道校验先于索引校验）
+	sl2 := newSelector(&fakeChannels{channels: map[int]*store.Channel{}}, &fakeKeys{}, fakeSP{})
+	_, err = sl2.Select(ctx, SelectReq{ChannelID: 9, KeyIndex: intPtr(0)})
+	if !errors.Is(err, ErrNoChannel) {
+		t.Fatalf("missing channel err = %v, want ErrNoChannel", err)
+	}
+
+	// 渠道被禁用 → ErrNoKey（与常规路径一致）
+	chDis := multiKeyChannel(11, []string{"k0"}, nil)
+	chDis.Status = store.ChannelStatusManuallyDisabled
+	sl3 := newSelector(&fakeChannels{channels: map[int]*store.Channel{11: chDis}}, &fakeKeys{}, fakeSP{})
+	_, err = sl3.Select(ctx, SelectReq{ChannelID: 11, KeyIndex: intPtr(0)})
+	if !errors.Is(err, ErrNoKey) {
+		t.Fatalf("disabled channel err = %v, want ErrNoKey", err)
+	}
+}
+
+// 直达在 Redis 降级（nil client）下仍可用：零 Redis 依赖。
+func TestSelectKeyIndexDirectWorksWhenRedisDegraded(t *testing.T) {
+	ch := multiKeyChannel(7, []string{"k0", "k1"}, nil)
+	var nilRdb *redisx.Client // SelectKey 会返回 ErrDegraded
+	sl := newSelector(&fakeChannels{channels: map[int]*store.Channel{7: ch}}, nilRdb, fakeSP{})
+
+	resp, err := sl.Select(context.Background(), SelectReq{ChannelID: 7, KeyIndex: intPtr(1)})
+	if err != nil {
+		t.Fatalf("direct should not need Redis: %v", err)
+	}
+	if resp.KeyIndex != 1 || resp.Key != "k1" {
+		t.Fatalf("resp = %+v", resp)
+	}
+}

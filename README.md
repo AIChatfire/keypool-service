@@ -36,6 +36,8 @@
   `OptionsPoller` 每 `SYNC_INTERVAL_SEC`（默认 60s）轮询 `options` 表生成配置快照。
 - `selector`：渠道确定（cid 直达或 abilities priority 分档 + weight 加权）→
   候选集（启用 key ∩ 当前轮换批次，空则 look-ahead）→ Lua 单 RTT 选 key。
+  传 `key_index` 时走精确直达短路：只校验索引范围与 key 启用状态，跳过候选集
+  与 Lua（零 Redis RTT）。
 - `state`：上报处理（幂等 → epoch 校验 → 用量校正 → 渠道锁 → classifier 判定 →
   事务写穿 → 事件 XADD），禁用/启用语义逐字节对齐 new-api。
 - `redisx`：`keypool:` 前缀的游标/用量 hash/衰减元数据/渠道锁/幂等键/事件 Stream，
@@ -93,13 +95,14 @@ docker run --env-file .env -p 8080:8080 keypool
 ### POST /v1/keys/select — 选 key
 
 渠道定位二选一：`channel_id` 直达，或 `group`+`model` 经 abilities 表
-priority 分档 + weight 加权选择。
+priority 分档 + weight 加权选择。再叠加可选的 `key_index` 做**单 key 精确直达**。
 
 请求体：
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `channel_id` | int | - | 渠道直达（与 group+model 二选一） |
+| `key_index` | int | - | **精确直达指定 key，必须搭配 `channel_id`**（详见下节） |
 | `group` / `model` | string | - | 按分组+模型选渠道 |
 | `retry` | int | 0 | 重试次数，影响 abilities 档位下探 |
 | `exclude` | array | - | 排除项 `[{"channel_id":7,"key_index":1}]` |
@@ -112,6 +115,11 @@ priority 分档 + weight 加权选择。
 # 渠道直达
 curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d '{
   "channel_id": 7
+}'
+
+# channel_id + key_index 精确直达（测活/复现/定向压测）
+curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d '{
+  "channel_id": 7, "key_index": 3
 }'
 
 # 分组+模型，排除已失败 key，usage 均衡 + 预扣，附带渠道元数据
@@ -178,6 +186,27 @@ curl -X POST $BASE/v1/keys/select -H "$H" -H 'Content-Type: application/json' -d
 - 无可用 key → 503 `code=40001`，`data.retry_after_ms=1000`；渠道不存在 → 404 `code=40002`。
 - **`epoch` 是 key 集合指纹**：拿到 key 后渠道 key 集合若被改动，携带旧 epoch
   的 report 会被忽略（`stale_epoch_ignored`），调用方应重新 select。
+
+#### key_index 精确直达
+
+传 `key_index` 即锁定渠道内第 N 个 key（0 起），**跳过所有选取算法**：不查
+轮换批次、不推轮询游标、不做 usage 打分与预扣，也**不访问 Redis**（Redis
+降级期间仍可用）。适用于测活、故障复现、定向压测等需要"就要这一把 key"的场景。
+
+| 约束 | 说明 |
+|------|------|
+| **必须搭配 `channel_id`** | 只传 `key_index`（走 `group`+`model`）→ 400 `40010`：`key_index requires channel_id`。渠道由加权算法动态选出，索引无从对应 |
+| 索引从 0 起，须 `>= 0` | 负数 → 400 `40010` |
+| `key_index` 越界 | → 400 `40010`（渠道 key 数不足，属永久性错误，重试无意义） |
+| 该 key 已被禁用 | → 503 `40001`（与常规无可用 key 一致，可能被重新启用故语义可重试） |
+| 渠道不存在 | → 404 `40002`（渠道校验先于索引校验） |
+| 渠道被禁用 | → 503 `40001` |
+
+响应差异：`mode` 固定返回 `"direct"`（表示未走任何调度算法），不返回
+`band`、不返回 `lease_id`；`key`/`base_url`/`epoch`/`channel` 与常规一致。
+同时传入的 `mode`、`est_tokens`、`advance_cursor`、`exclude` **一律被忽略**。
+
+指标：直达命中额外累加 `keypool_select_direct_total`。
 
 ### POST /v1/keys/report — 上报调用结果
 
@@ -303,7 +332,8 @@ curl -X POST $BASE/v1/settings/reload -H "$H"     # → {"reloaded":true}
 ```bash
 curl $BASE/metrics -H "$H"
 # keypool_select_total{cid,idx} / keypool_report_total{action} /
-# keypool_band_lookahead_total / keypool_process_uptime_seconds
+# keypool_band_lookahead_total / keypool_select_direct_total /
+# keypool_process_uptime_seconds
 ```
 
 ## 与 new-api 共存（防冲突设计）

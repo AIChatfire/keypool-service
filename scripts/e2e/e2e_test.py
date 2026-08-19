@@ -261,6 +261,38 @@ check("T18c bad status -> 40010", s == 400 and b.get("code") == 40010, (s, b.get
 s, _ = call("POST", "/v1/key:get", {"channel_id": 12})
 check("T19 legacy key:get gone", s in (404, 405), s)
 
+# T20 channel_id + key_index 精确直达
+s, b = call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": 3})
+d20 = b.get("data") or {}
+check("T20 direct hit key_index=3", s == 200 and d20.get("key_index") == 3
+      and d20.get("mode") == "direct" and "band" not in d20 and "lease_id" not in d20, d20)
+# 连续 5 次都返回同一把（不推游标、不受轮询影响）
+same = all((call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": 3})[1]["data"]["key_index"] == 3)
+           for _ in range(5))
+check("T20b direct is deterministic", same)
+# key_index=0 合法（不被零值遮蔽）
+s, b = call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": 0})
+check("T20c direct key_index=0 valid", s == 200 and b["data"]["key_index"] == 0, b.get("data"))
+# 缺 channel_id -> 40010
+s, b = call("POST", "/v1/keys/select", {"group": "default", "model": "gpt-4o", "key_index": 1})
+check("T20d key_index without channel_id -> 40010", s == 400 and b.get("code") == 40010, (s, b.get("code")))
+# 负数 / 越界 -> 40010
+s, b = call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": -1})
+check("T20e negative key_index -> 40010", s == 400 and b.get("code") == 40010, (s, b.get("code")))
+s, b = call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": 99})
+check("T20f out-of-range key_index -> 40010", s == 400 and b.get("code") == 40010, (s, b.get("code")))
+# 被禁用的 key -> 503/40001
+call("PATCH", "/v1/channels/12/keys/1", {"status": "disabled", "reason": "e2e direct"})
+db_retry(lambda: db_channel(12), lambda r: "1" in r[1].get("multi_key_status_list", {}))
+s, b = call("POST", "/v1/keys/select", {"channel_id": 12, "key_index": 1})
+check("T20g disabled key direct -> 503/40001", s == 503 and b.get("code") == 40001, (s, b.get("code")))
+call("PATCH", "/v1/channels/12/keys/1", {"status": "enabled"})
+db_retry(lambda: db_channel(12), lambda r: "1" not in r[1].get("multi_key_status_list", {}))
+# 直达命中计入 select_direct_total
+req = urllib.request.Request(BASE + "/metrics"); req.add_header("Authorization", "Bearer " + TOK)
+with urllib.request.urlopen(req, timeout=10) as r: mtext2 = r.read().decode()
+check("T20h select_direct_total exposed", "keypool_select_direct_total" in mtext2)
+
 fails = [n for n, ok, _ in results if not ok]
 print(f"\n==== {len(results)-len(fails)}/{len(results)} PASS ====")
 if fails: print("FAILED:", fails)

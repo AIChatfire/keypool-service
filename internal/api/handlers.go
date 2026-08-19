@@ -22,9 +22,11 @@ type keyRefDTO struct {
 }
 
 // selectReqDTO 是 SelectReq 的 wire 形态（snake_case）。
-// AdvanceCursor 用指针以区分“未传”（默认 true）与显式 false。
+// AdvanceCursor 用指针以区分“未传”（默认 true）与显式 false；
+// KeyIndex 同理用指针区分“未传”与显式 0（0 是合法 key 索引）。
 type selectReqDTO struct {
 	ChannelID      int         `json:"channel_id"`
+	KeyIndex       *int        `json:"key_index"` // 精确直达，必须搭配 channel_id
 	Group          string      `json:"group"`
 	Model          string      `json:"model"`
 	Retry          int         `json:"retry"`
@@ -69,8 +71,21 @@ func (rt *router) handleKeySelect(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, r, "channel_id or group+model is required")
 		return
 	}
+	// key_index 精确直达：必须搭配 channel_id（group+model 选出的渠道
+	// 不确定，索引无从对应），且索引非负。
+	if body.KeyIndex != nil {
+		if body.ChannelID <= 0 {
+			writeBadRequest(w, r, "key_index requires channel_id")
+			return
+		}
+		if *body.KeyIndex < 0 {
+			writeBadRequest(w, r, "key_index must be >= 0")
+			return
+		}
+	}
 	req := selector.SelectReq{
 		ChannelID: body.ChannelID,
+		KeyIndex:  body.KeyIndex,
 		Group:     body.Group,
 		Model:     body.Model,
 		Retry:     body.Retry,

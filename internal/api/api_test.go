@@ -897,3 +897,63 @@ func TestKeyReportKeyIndexPointer(t *testing.T) {
 		t.Fatalf("KeyIndex = %v, want pointer to 0", m.lastRep.KeyIndex)
 	}
 }
+
+// keys/select 的 key_index 精确直达（api 侧）：
+// 未传 → nil；显式 0 → 指针指向 0（不被零值遮蔽）；缺 channel_id / 负数 → 40010。
+func TestKeySelectKeyIndexDirect(t *testing.T) {
+	sl := okSelector()
+	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
+
+	// 未传 key_index → SelectReq.KeyIndex 为 nil（常规选取路径）
+	status, _ := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7}`))))
+	if status != http.StatusOK {
+		t.Fatalf("status=%d", status)
+	}
+	if sl.lastReq.KeyIndex != nil {
+		t.Fatalf("KeyIndex = %v, want nil (not provided)", *sl.lastReq.KeyIndex)
+	}
+
+	// 显式 key_index=0 → 指针指向 0
+	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7,"key_index":0}`))))
+	if status != http.StatusOK {
+		t.Fatalf("status=%d", status)
+	}
+	if sl.lastReq.KeyIndex == nil || *sl.lastReq.KeyIndex != 0 {
+		t.Fatalf("KeyIndex = %v, want pointer to 0", sl.lastReq.KeyIndex)
+	}
+
+	// key_index=3 透传
+	status, _ = do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7,"key_index":3}`))))
+	if status != http.StatusOK || sl.lastReq.KeyIndex == nil || *sl.lastReq.KeyIndex != 3 {
+		t.Fatalf("status=%d KeyIndex=%v, want 3", status, sl.lastReq.KeyIndex)
+	}
+
+	// 非法组合 → 40010
+	for _, body := range []string{
+		`{"group":"default","model":"gpt-x","key_index":1}`, // 缺 channel_id
+		`{"channel_id":7,"key_index":-1}`,                   // 负数
+	} {
+		status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select", strings.NewReader(body))))
+		if status != http.StatusBadRequest || env.Code != CodeBadRequest {
+			t.Fatalf("body=%s: status=%d env=%+v, want 40010", body, status, env)
+		}
+	}
+}
+
+// selector.ErrInvalidRequest（如 key_index 越界）→ 400/40010。
+func TestSelectorInvalidRequestMapping(t *testing.T) {
+	sl := okSelector()
+	sl.err = fmt.Errorf("%w: key_index 9 out of range (channel 7 has 3 keys)", selector.ErrInvalidRequest)
+	h := newTestRouter(sl, okManager(), &fakeStore{}, &fakeProvider{}, nil)
+	status, env := do(t, h, authed(httptest.NewRequest("POST", "/v1/keys/select",
+		strings.NewReader(`{"channel_id":7,"key_index":9}`))))
+	if status != http.StatusBadRequest || env.Code != CodeBadRequest {
+		t.Fatalf("status=%d env=%+v, want 400/40010", status, env)
+	}
+	if !strings.Contains(env.Message, "out of range") {
+		t.Fatalf("message=%q want to contain reason", env.Message)
+	}
+}

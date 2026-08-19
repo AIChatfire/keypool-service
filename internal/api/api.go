@@ -218,10 +218,11 @@ func writeOK(w http.ResponseWriter, r *http.Request, data any) {
 
 // writeErr 集中错误映射（SPEC §5 错误码表）：
 //
-//	selector.ErrNoKey        → 503/40001（data.retry_after_ms=1000）
-//	selector.ErrNoChannel    → 404/40002
-//	state.ErrChannelNotFound → 404/40002
-//	state.ErrInvalidRequest  → 400/40010
+//	selector.ErrNoKey            → 503/40001（data.retry_after_ms=1000）
+//	selector.ErrNoChannel        → 404/40002
+//	state.ErrChannelNotFound     → 404/40002
+//	selector.ErrInvalidRequest   → 400/40010（key_index 越界等）
+//	state.ErrInvalidRequest      → 400/40010
 //	state.ErrLockFailed      → 503/50001
 //	redisx.ErrDegraded       → 503/50001（Redis 降级）
 //	selector.ErrDependency   → 503/50001（DB 故障，非 NotFound）
@@ -239,7 +240,7 @@ func writeDomainErr(w http.ResponseWriter, r *http.Request, err error) {
 			"no available key", map[string]any{"retry_after_ms": retryAfterMs})
 	case errors.Is(err, selector.ErrNoChannel), errors.Is(err, state.ErrChannelNotFound):
 		writeErr(w, r, http.StatusNotFound, CodeChannelMissing, "channel not found", nil)
-	case errors.Is(err, state.ErrInvalidRequest):
+	case errors.Is(err, selector.ErrInvalidRequest), errors.Is(err, state.ErrInvalidRequest):
 		writeErr(w, r, http.StatusBadRequest, CodeBadRequest, err.Error(), nil)
 	case errors.Is(err, state.ErrLockFailed):
 		writeErr(w, r, http.StatusServiceUnavailable, CodeInternal, err.Error(), nil)
